@@ -59,13 +59,22 @@ class Policy(BasePolicy):
             (transform for transform in transforms if isinstance(transform, _transforms.Normalize)), None
         )
 
+        self._sample_actions_rtc = None
         if self._is_pytorch_model:
             self._model = self._model.to(pytorch_device)
             self._model.eval()
             self._sample_actions = model.sample_actions
+            if callable(getattr(self._model, "sample_actions_rtc", None)):
+                self._sample_actions_rtc = self._model.sample_actions_rtc
         else:
             # JAX model setup
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
+            if callable(getattr(model, "sample_actions_rtc", None)):
+                # Mask sizes and the guidance cap must stay concrete inside the trace.
+                self._sample_actions_rtc = nnx_utils.module_jit(
+                    model.sample_actions_rtc,
+                    static_argnames=("executed_steps", "delay_steps", "num_steps", "guidance_beta"),
+                )
             self._rng = rng or jax.random.key(0)
 
     @override
@@ -73,8 +82,8 @@ class Policy(BasePolicy):
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
         rtc_request = inputs.pop("rtc", None)
-        if rtc_request is not None and not self._is_pytorch_model:
-            raise ValueError("RTC requests require a PyTorch policy")
+        if rtc_request is not None and self._sample_actions_rtc is None:
+            raise ValueError("RTC requests require a policy whose model implements sample_actions_rtc")
         inputs = self._input_transform(inputs)
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
@@ -107,20 +116,31 @@ class Policy(BasePolicy):
             executed = int(rtc_request["executed_steps"])
             delay = int(rtc_request["delay_steps"])
             previous = np.asarray(rtc_request["previous_actions"], dtype=np.float32)
-            horizon = self._model.config.action_horizon
+            model_config = getattr(self._model, "config", None)
+            if model_config is not None and hasattr(model_config, "action_horizon"):
+                horizon = int(model_config.action_horizon)
+                model_action_dim = int(model_config.action_dim)
+            else:
+                # JAX Pi0 stores the sizes on the module; it has no PyTorch config object.
+                horizon = int(self._model.action_horizon)
+                model_action_dim = int(self._model.action_dim)
             actual_dim = len(self._action_normalizer.norm_stats["actions"].mean)
             if previous.shape != (horizon - executed, actual_dim) or not np.isfinite(previous).all():
                 raise ValueError("RTC previous_actions has invalid shape or values")
             normalized = self._action_normalizer({"actions": previous})["actions"]
-            padded = np.zeros((horizon - executed, self._model.config.action_dim), dtype=np.float32)
+            padded = np.zeros((horizon - executed, model_action_dim), dtype=np.float32)
             padded[:, :actual_dim] = normalized
+            if self._is_pytorch_model:
+                previous_batch = torch.from_numpy(padded)[None].to(self._pytorch_device)
+            else:
+                previous_batch = jnp.asarray(padded)[None, ...]
             sample_kwargs.update(
-                previous_actions=torch.from_numpy(padded)[None].to(self._pytorch_device),
+                previous_actions=previous_batch,
                 executed_steps=executed,
                 delay_steps=delay,
                 guidance_beta=float(rtc_request.get("guidance_beta", 5.0)),
             )
-            sampler = self._model.sample_actions_rtc
+            sampler = self._sample_actions_rtc
         outputs = {
             "state": inputs["state"],
             "actions": sampler(sample_rng_or_pytorch_device, observation, **sample_kwargs),
@@ -139,8 +159,11 @@ class Policy(BasePolicy):
 
     @property
     def metadata(self) -> dict[str, Any]:
-        metadata = {**self._metadata, "rtc_supported": self._is_pytorch_model}
-        if self._is_pytorch_model and os.environ.get("OPENPI_RTC_HARDWARE_ALLOWED") != "1":
+        supported = self._sample_actions_rtc is not None
+        metadata = {**self._metadata, "rtc_supported": supported}
+        # Same hardware gate for JAX and PyTorch.  jax_infer.py may override this
+        # with --allow-hardware after copying the metadata.
+        if supported and os.environ.get("OPENPI_RTC_HARDWARE_ALLOWED") != "1":
             metadata["hardware_allowed"] = False
         return metadata
 

@@ -20,8 +20,12 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parent
 PACKAGE_ROOT = Path(os.environ.get("TB6R5_PACKAGE_ROOT", ROOT.parent / "tb6r5_policy_infer"))
-for source in (PACKAGE_ROOT, ROOT / "app/packages/openpi-client/src"):
-    if str(source) not in sys.path:
+for source in (
+    PACKAGE_ROOT,
+    ROOT / "app/packages/openpi-client/src",
+    ROOT / "docker_source/packages/openpi-client/src",
+):
+    if source.is_dir() and str(source) not in sys.path:
         sys.path.insert(0, str(source))
 
 from openpi_client import msgpack_numpy
@@ -420,6 +424,10 @@ def build_parser():
     parser.add_argument("--action-space", choices=("ee_pose", "joints"), default="ee_pose")
     parser.add_argument("--fps", type=float, default=30)
     parser.add_argument("--n-action-steps", type=int, default=4)
+    parser.add_argument("--rtc", action="store_true", help="Asynchronous guided Real-Time Chunking (JAX or PyTorch server)")
+    parser.add_argument("--rtc-num-steps", type=int, default=5)
+    parser.add_argument("--rtc-min-execution-steps", type=int, default=2)
+    parser.add_argument("--rtc-guidance-beta", type=float, default=5.0)
     parser.add_argument("--joint-step-max-rad", type=float, default=.03)
     parser.add_argument("--ee-step-max-m", type=float, default=.03)
     parser.add_argument("--rotation-step-max-rad", type=float, default=.15)
@@ -440,6 +448,12 @@ def validate_args(args):
         raise SafetyAbort("Dataset recorder requires validated actions, not --smoke-test")
     if args.record_fps < 1 or args.record_episode_frames < 1:
         raise SafetyAbort("Recording FPS and episode length must be positive")
+    if args.rtc and (args.rtc_num_steps < 1 or not 1 <= args.rtc_min_execution_steps < 10):
+        raise SafetyAbort("RTC requires positive denoising steps and min execution steps in 1..9")
+    if args.rtc and (not math.isfinite(args.rtc_guidance_beta) or args.rtc_guidance_beta <= 0):
+        raise SafetyAbort("RTC guidance beta must be positive and finite")
+    if args.rtc and args.smoke_test:
+        raise SafetyAbort("RTC needs a real-time observation and feedback stream")
     if args.smoke_test:
         if not args.no_camera or args.print_rpc:
             raise SafetyAbort("--smoke-test requires --no-camera without --print-rpc; it always uses dry-run")
@@ -458,10 +472,157 @@ def validate_args(args):
         raise SafetyAbort("Gripper limits must satisfy 0 <= min < max <= 80 mm")
 
 
-def run(args):
-    from tb6r5_policy_infer.hardware.tb6r5 import TB6R5Interface, validate_robot_sdk
+def _checkpoint_mean_state(args):
+    stats = json.loads(Path(args.norm_stats).read_text())["norm_stats"]
+    return np.asarray(stats["state"]["mean"], dtype=np.float32)
 
+
+def _live_or_offline_state(args, feedback, limits):
+    if feedback is not None:
+        return limits.validate_state(feedback.read())
+    if not getattr(args, "offline_dry_run", False):
+        raise SafetyAbort("RTC requires live robot feedback")
+    return limits.validate_state(_checkpoint_mean_state(args))
+
+
+def _record_step(recorder, limits, images, state, target, task):
+    recorded = np.array(target, dtype=np.float32, copy=True)
+    # The dataset stores gripper opening in metres.  gripper_mm clips the command.
+    recorded[-1] = limits.gripper_mm(target) / 1000.0
+    recorder.record(images, state, recorded, task)
+
+
+def run_rtc_loop(args, client, feedback, cameras, formatter, limits, recorder=None):
+    """Consume a chunk on control ticks while the next guided chunk is sampled."""
+
+    def observe():
+        images = cameras.capture() if cameras else {
+            name: np.zeros((224, 224, 3), dtype=np.uint8) for name in ("realsense_0", "realsense_1")
+        }
+        state = _live_or_offline_state(args, feedback, limits)
+        return state, images, prepare_observation(state, images, args.task, allow_constant_images=args.no_camera)
+
+    arm = None
+    calls = steps = 0
+    latencies = []
+    period = 1.0 / args.fps
+    state, images, observation = observe()
+    observation["rtc"] = {"num_steps": args.rtc_num_steps}
+    print("[RTC] Warming policy before opening the robot command channel", flush=True)
+    client.infer(observation, args.first_action_timeout_s)
+    state, images, observation = observe()
+    observation["rtc"] = {"num_steps": args.rtc_num_steps}
+    started = time.monotonic()
+    actions = action_array(client.infer(observation, args.first_action_timeout_s))
+    latencies.append(time.monotonic() - started)
+    actions = limits.validate_actions(actions, state)
+    horizon = len(actions)
+    if horizon != 10:
+        raise SafetyAbort(f"RTC expected this checkpoint's 10-step horizon; received {horizon}")
+    calls += 1
+    index = 0
+    future = None
+    sent_during_inference = 0
+    next_tick = time.monotonic()
+    print(f"[RTC] Initial chunk ready in {latencies[-1]:.3f}s; {horizon} actions at {args.fps:g} Hz", flush=True)
+    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rtc-infer")
+    try:
+        while True:
+            if future is not None and future.done():
+                latency = time.monotonic() - inference_started
+                replacement = action_array(future.result())
+                future = None
+                if replacement.shape != actions.shape:
+                    raise SafetyAbort(f"RTC action shape changed from {actions.shape} to {replacement.shape}")
+                if sent_during_inference >= horizon:
+                    raise SafetyAbort("RTC inference arrived after the entire active chunk was executed")
+                current_state = _live_or_offline_state(args, feedback, limits)
+                limits.validate_actions(replacement[sent_during_inference:], current_state)
+                actions = replacement
+                index = sent_during_inference
+                latencies.append(latency)
+                latencies = latencies[-10:]
+                print(f"[RTC] chunk {calls}: {latency:.3f}s; skipped {index} elapsed actions", flush=True)
+
+            if (future is None and index >= args.rtc_min_execution_steps
+                    and (not args.max_inference_calls or calls < args.max_inference_calls)):
+                delay_steps = math.ceil(max(latencies) * args.fps) + 1
+                overlap = horizon - index
+                if delay_steps > overlap:
+                    raise SafetyAbort(
+                        f"RTC latency needs {delay_steps} steps, but only {overlap} remain; "
+                        "reduce inference latency or controller frequency"
+                    )
+                _, images, observation = observe()
+                observation["rtc"] = {
+                    "previous_actions": actions[index:].copy(),
+                    "executed_steps": index,
+                    "delay_steps": delay_steps,
+                    "num_steps": args.rtc_num_steps,
+                    "guidance_beta": args.rtc_guidance_beta,
+                }
+                inference_started = time.monotonic()
+                future = pool.submit(client.infer, observation, args.action_timeout_s)
+                sent_during_inference = 0
+                calls += 1
+                print(f"[RTC] Requested chunk {calls}, overlap={overlap}, delay_budget={delay_steps}", flush=True)
+
+            if index >= horizon:
+                if future is not None:
+                    raise SafetyAbort("RTC active chunk exhausted before the next inference completed")
+                break
+
+            target = actions[index]
+            step_state = _live_or_offline_state(args, feedback, limits)
+            limits.validate_actions(target[None, :], step_state)
+            grip_mm = limits.gripper_mm(target)
+            kwargs = dict(max_distance=args.gripper_max_distance, min_distance=args.gripper_min_distance)
+            if args.dry_run:
+                if args.print_rpc:
+                    command = formatter.build_cartesian_stream_cmd(
+                        target[:3], target[3:7], grip_mm, int(steps > 0), **kwargs
+                    ) if args.action_space == "ee_pose" else formatter.build_subloop1_stream_cmd(
+                        target[:6], grip_mm, int(steps > 0), **kwargs
+                    )
+                    print(f"[RTC][RPC] dry-run would send: {command}", flush=True)
+            else:
+                if formatter is None:
+                    raise SafetyAbort("RTC hardware control requires the robot SDK")
+                if arm is None:
+                    arm = formatter
+                    arm.connect()
+                    limits.validate_actions(target[None, :], feedback.read())
+                sent = (arm.set_cartesian_target_with_gripper(target[:3], target[3:7], grip_mm, cmd_delta=0, **kwargs)
+                        if args.action_space == "ee_pose" else
+                        arm.set_joint_positions_with_gripper(target[:6], grip_mm, cmd_delta=0, **kwargs))
+                if not sent:
+                    raise SafetyAbort("Robot rejected RTC motion command")
+            if recorder is not None:
+                step_images = cameras.capture() if cameras else images
+                _record_step(recorder, limits, step_images, step_state, target, args.task)
+            steps += 1
+            index += 1
+            if future is not None:
+                sent_during_inference += 1
+            next_tick += period
+            time.sleep(max(0.0, next_tick - time.monotonic()))
+    finally:
+        try:
+            if arm is not None:
+                arm.disconnect()
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
+    print(f"[OK] RTC completed {calls} inference calls and {steps} control steps", flush=True)
+    return 0
+
+
+def run(args):
     validate_args(args)
+    needs_robot_sdk = args.local_check or args.print_rpc or not args.offline_dry_run
+    if needs_robot_sdk:
+        from tb6r5_policy_infer.hardware.tb6r5 import TB6R5Interface, validate_robot_sdk
+    else:
+        TB6R5Interface = validate_robot_sdk = None
     if args.smoke_test:
         print("[OPENPI] Smoke-test: dry-run with black images and checkpoint mean state; no robot commands", flush=True)
     limits = SafetyLimits.load(
@@ -478,6 +639,8 @@ def run(args):
     try:
         client = PolicyClient(args.policy_host, args.policy_port, args.first_action_timeout_s)
         validate_policy_server_metadata(client.metadata, dry_run=args.dry_run)
+        if args.rtc and not client.metadata.get("rtc_supported"):
+            raise SafetyAbort("Policy server does not advertise RTC support")
         print(f"[OPENPI] Server metadata: {client.metadata}", flush=True)
         if not args.no_camera:
             cameras = Cameras(args)
@@ -490,10 +653,14 @@ def run(args):
             recorder = InferenceRecorder(args.record_dataset, args.recorder_python,
                                          args.record_fps, args.record_episode_frames)
             print(f"[RECORD] LeRobotDataset: {recorder.root}", flush=True)
-        formatter = TB6R5Interface(
-            args.robot_ip, args.rpc_port, enable_topic=False, print_rpc=args.print_rpc,
-            g_model=args.g_model, cd_version=args.cd_version, subloop=args.subloop,
-        )
+        formatter = None
+        if TB6R5Interface is not None:
+            formatter = TB6R5Interface(
+                args.robot_ip, args.rpc_port, enable_topic=False, print_rpc=args.print_rpc,
+                g_model=args.g_model, cd_version=args.cd_version, subloop=args.subloop,
+            )
+        if args.rtc:
+            return run_rtc_loop(args, client, feedback, cameras, formatter, limits, recorder)
         calls, steps = 0, 0
         max_calls = args.max_inference_calls or (1 if args.smoke_test else 0)
         while not max_calls or calls < max_calls:

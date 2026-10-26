@@ -60,5 +60,7 @@ class InferenceRecorder:
             finally:
                 if self.process.poll() is None:
                     self.process.terminate()
+                if self.process.stdout is not None:
+                    self.process.stdout.close()
         else:
             raise RuntimeError(f"Recorder exited unexpectedly: {self.process.returncode}")

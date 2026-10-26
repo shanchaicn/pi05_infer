@@ -1,9 +1,13 @@
 # pi05_infer 独立 JAX 推理
 
-`jax_infer.py` 直接复用本目录 `app/src/openpi` 的模型、JIT 和数据变换，提供
-`check`、`infer`、`serve`、`client` 四个命令。它直接从 `params/` 恢复 JAX 权重，
-并通过 `Policy(..., is_pytorch=False)` 执行推理。同目录即使有 `model.safetensors`，
-也不会切换到 PyTorch。
+`jax_infer.py` 复用仓库里的 OpenPI 模型、JIT 和数据变换，提供
+`check`、`infer`、`serve`、`client` 四个命令。未设置 `OPENPI_ROOT` 时，模型代码
+来自 `rtc_stage/`（JAX 与 PyTorch 共用的 RTC 实现），客户端来自
+`docker_source/packages/openpi-client`；若设置了 `OPENPI_ROOT`，则使用该目录下的
+`src/openpi`。它直接从 `params/` 恢复 JAX 权重，并通过 `Policy(..., is_pytorch=False)`
+执行推理。同目录即使有 `model.safetensors`，也不会切换到 PyTorch。服务元数据里的
+`rtc_supported` 在 JAX `Pi0.sample_actions_rtc` 可用时为 true，主机可以用 `--rtc`
+连到这个服务。
 
 流程：原始 observation → 训练配置的数据输入变换 → Normalize → 模型输入变换 →
 JAX JIT/sample_actions → 模型输出变换 → Unnormalize → 训练配置的数据输出变换。

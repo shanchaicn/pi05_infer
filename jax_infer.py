@@ -14,10 +14,37 @@ import time
 import numpy as np
 
 
-OPENPI_ROOT = Path(os.environ.get("OPENPI_ROOT", Path(__file__).resolve().parent / "app"))
-for source in (OPENPI_ROOT / "src", OPENPI_ROOT / "packages/openpi-client/src"):
-    if source.is_dir():
-        sys.path.insert(0, str(source))
+def _install_import_paths() -> None:
+    """Put the in-repo OpenPI tree and the websocket client on ``sys.path``.
+
+    ``rtc_stage`` is the tree that implements Real-Time Chunking for both JAX
+    and PyTorch.  ``OPENPI_ROOT`` still overrides it (``src/openpi`` or a
+    directory that itself contains ``openpi``).  ``app/`` remains an optional
+    full checkout for ``openpi_client``.
+    """
+    root = Path(__file__).resolve().parent
+    explicit = os.environ.get("OPENPI_ROOT")
+    if explicit:
+        base = Path(explicit)
+        entries = [base / "src", base, base / "packages/openpi-client/src"]
+    else:
+        entries = [
+            root / "docker_source" / "src",
+            root / "app" / "src",
+            root / "docker_source" / "packages/openpi-client/src",
+            root / "app" / "packages/openpi-client/src",
+            root / "rtc_stage",
+        ]
+    for source in entries:
+        if not source.is_dir():
+            continue
+        path = str(source)
+        if path in sys.path:
+            sys.path.remove(path)
+        sys.path.insert(0, path)
+
+
+_install_import_paths()
 
 
 def validate_checkpoint(checkpoint: Path, asset_id: str | None = None) -> dict:
