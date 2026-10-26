@@ -83,6 +83,24 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(resized.shape, (224, 224, 3))
         self.assertEqual(resized.dtype, np.uint8)
 
+    def test_live_720p_matches_stretched_dataset_frame(self):
+        import cv2
+
+        wide = np.zeros((720, 1280, 3), dtype=np.uint8)
+        wide[:, :, 0] = np.linspace(0, 255, 1280, dtype=np.uint8)[None, :]
+        wide[:, :, 1] = np.linspace(0, 255, 720, dtype=np.uint8)[:, None]
+        stored = cv2.resize(wide, (640, 480), interpolation=cv2.INTER_LINEAR)
+        np.testing.assert_array_equal(runner.match_training_frame(wide), stored)
+        np.testing.assert_array_equal(runner.match_training_frame(stored), stored)
+        state = runner.DEFAULT_DRY_STATE
+        images = {"realsense_0": wide, "realsense_1": wide}
+        observation = runner.prepare_observation(state, images, "pick")
+        expected = runner.resize_with_pad(stored)
+        np.testing.assert_array_equal(observation["observation/image"], expected)
+        np.testing.assert_array_equal(observation["observation/wrist_image"], expected)
+        untouched = runner.resize_with_pad(wide)
+        self.assertFalse(np.array_equal(observation["observation/image"], untouched))
+
     def test_safe_action_chunk(self):
         state = runner.DEFAULT_DRY_STATE.copy()
         actions = np.repeat(state[None, :], 10, axis=0)

@@ -8,6 +8,8 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+import http.client
+import importlib.util
 import json
 import math
 import os
@@ -20,8 +22,13 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parent
 PACKAGE_ROOT = Path(os.environ.get("TB6R5_PACKAGE_ROOT", ROOT.parent / "tb6r5_policy_infer"))
-for source in (PACKAGE_ROOT, ROOT / "app/packages/openpi-client/src", ROOT.parent / "app/packages/openpi-client/src"):
-    if str(source) not in sys.path:
+for source in (
+    PACKAGE_ROOT,
+    ROOT / "app/packages/openpi-client/src",
+    ROOT.parent / "app/packages/openpi-client/src",
+    ROOT.parent / "docker_source/packages/openpi-client/src",
+):
+    if source.is_dir() and str(source) not in sys.path:
         sys.path.insert(0, str(source))
 
 from openpi_client import msgpack_numpy
@@ -105,6 +112,28 @@ def checked_quaternion(value):
     return quat
 
 
+# pp_white_red stores 1280x720 cameras stretched to this 4:3 frame.
+TRAINING_FRAME_WIDTH = 640
+TRAINING_FRAME_HEIGHT = 480
+
+
+def match_training_frame(image):
+    """Stretch a live frame to the 640x480 image the dataset actually stored.
+
+    A direct resize from 1280x720 makes objects about 33% taller. The policy
+    then pads that 4:3 frame to 224. Sending the original 16:9 frame pads a
+    different canvas, so do the same stretch before padding.
+    """
+    import cv2
+
+    image = np.asarray(image)
+    if image.ndim != 3 or image.shape[2] != 3 or min(image.shape[:2]) < 1 or image.dtype != np.uint8:
+        raise SafetyAbort("Camera image must be a non-empty RGB uint8 HWC array")
+    if image.shape[0] == TRAINING_FRAME_HEIGHT and image.shape[1] == TRAINING_FRAME_WIDTH:
+        return image
+    return cv2.resize(image, (TRAINING_FRAME_WIDTH, TRAINING_FRAME_HEIGHT), interpolation=cv2.INTER_LINEAR)
+
+
 def resize_with_pad(image, size=224):
     import cv2
 
@@ -132,7 +161,7 @@ def prepare_observation(state, images, task, *, allow_constant_images=False):
         if name not in images:
             raise SafetyAbort(f"Missing camera: {name}")
         raw = np.asarray(images[name])
-        image = resize_with_pad(raw)
+        image = resize_with_pad(match_training_frame(raw))
         if not allow_constant_images and (raw.max() == raw.min() or float(raw.std()) < 1):
             raise SafetyAbort(f"Camera {name} returned an empty/constant frame")
         observation[key] = image
@@ -187,8 +216,21 @@ class SafetyLimits:
         if self.action_space == "ee_pose":
             value[3:7] = checked_quaternion(value[3:7])
         low, high = self.bounds[kind]
+        if self.action_space == "ee_pose":
+            # q and -q encode the same rotation. Controllers may return the
+            # opposite sign from the dataset, so align to the checkpoint
+            # quaternion hemisphere before component-wise envelope checks.
+            training_center = (low[3:7] + high[3:7]) * .5
+            if float(np.dot(value[3:7], training_center)) < 0:
+                value[3:7] *= -1
         padding = np.maximum(high - low, .01) * self.margin
-        if np.any(value < low - padding) or np.any(value > high + padding):
+        outside = (value < low - padding) | (value > high + padding)
+        if self.action_space == "ee_pose":
+            # Quaternion components are coupled and q/-q are equivalent, so
+            # per-component quantile bounds can reject a valid nearby pose.
+            # Quaternion norm and per-step angular distance remain checked.
+            outside[3:7] = False
+        if np.any(outside):
             raise SafetyAbort(f"{kind} outside checkpoint training envelope: {value.tolist()}")
         return value
 
@@ -343,21 +385,35 @@ class Cameras:
         import cv2
         from tb6r5_policy_infer.camera import HttpCameraStream
 
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        deadline = time.monotonic() + self.args.camera_timeout_s
-        with opener.open(url, timeout=self.args.camera_timeout_s) as response:
-            buffer = b""
-            while time.monotonic() < deadline and len(buffer) < 4 * 1024 * 1024:
-                block = response.read1(8192)
-                if not block:
-                    break
-                buffer += block
-                jpeg = HttpCameraStream._extract_jpeg_bytes(buffer)
-                if jpeg:
-                    bgr = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
-                    if bgr is not None:
-                        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        raise SafetyAbort(f"No complete camera frame from {url}")
+        last_error = "no complete JPEG frame"
+        for attempt in range(1, self.args.camera_retries + 1):
+            try:
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                deadline = time.monotonic() + self.args.camera_timeout_s
+                with opener.open(url, timeout=self.args.camera_timeout_s) as response:
+                    buffer = b""
+                    while time.monotonic() < deadline and len(buffer) < 4 * 1024 * 1024:
+                        block = response.read1(8192)
+                        if not block:
+                            break
+                        buffer += block
+                        jpeg = HttpCameraStream._extract_jpeg_bytes(buffer)
+                        if jpeg:
+                            bgr = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+                            if bgr is not None:
+                                return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                last_error = "stream returned no complete JPEG frame"
+            except (TimeoutError, urllib.error.URLError, http.client.HTTPException, OSError) as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+            if attempt < self.args.camera_retries:
+                print(
+                    f"[CAMERA] {url} attempt {attempt}/{self.args.camera_retries} failed: "
+                    f"{last_error}; retrying",
+                    flush=True,
+                )
+        raise SafetyAbort(
+            f"Camera HTTP failed after {self.args.camera_retries} attempts: {url}: {last_error}"
+        )
 
     def capture(self):
         import cv2
@@ -402,6 +458,7 @@ def build_parser():
     parser.add_argument("--policy-port", type=int, default=8002)
     parser.add_argument("--task", default=DEFAULT_TASK)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--offline-dry-run", action="store_true", help="Synthetic cameras/state; no robot connection (requires --dry-run --no-camera)")
     parser.add_argument("--record-dataset", type=Path, help="New local LeRobot v3 dataset directory")
     parser.add_argument("--recorder-python", default="/home/ai/condaenv/tb6r5/bin/python")
     parser.add_argument("--record-fps", type=int, default=2)
@@ -418,6 +475,7 @@ def build_parser():
     parser.add_argument("--feedback-timeout-s", type=float, default=5)
     parser.add_argument("--feedback-max-age-s", type=float, default=.5)
     parser.add_argument("--camera-timeout-s", type=float, default=5)
+    parser.add_argument("--camera-retries", type=int, default=3)
     camera_group = parser.add_mutually_exclusive_group()
     for option in ("--camera-urls", "--camera-devices", "--camera-serials"):
         camera_group.add_argument(option)
@@ -425,7 +483,7 @@ def build_parser():
     parser.add_argument("--action-space", choices=("ee_pose", "joints"), default="ee_pose")
     parser.add_argument("--fps", type=float, default=30)
     parser.add_argument("--n-action-steps", type=int, default=4)
-    parser.add_argument("--rtc", action="store_true", help="Use asynchronous guided Real-Time Chunking (PyTorch server only)")
+    parser.add_argument("--rtc", action="store_true", help="Asynchronous guided Real-Time Chunking (JAX or PyTorch server)")
     parser.add_argument("--rtc-num-steps", type=int, default=5)
     parser.add_argument("--rtc-min-execution-steps", type=int, default=2)
     parser.add_argument("--rtc-guidance-beta", type=float, default=5.0)
@@ -441,6 +499,8 @@ def build_parser():
 
 
 def validate_args(args):
+    if args.offline_dry_run and not (args.dry_run and args.no_camera):
+        raise SafetyAbort("--offline-dry-run requires --dry-run --no-camera")
     if args.record_dataset and args.action_space != "ee_pose":
         raise SafetyAbort("Dataset recorder currently supports 8D ee_pose only")
     if args.record_dataset and args.smoke_test:
@@ -457,6 +517,8 @@ def validate_args(args):
         raise SafetyAbort("Hardware requires real camera frames")
     if args.max_inference_calls < 0 or args.n_action_steps < 1:
         raise SafetyAbort("Invalid inference/action count")
+    if args.camera_retries < 1:
+        raise SafetyAbort("camera_retries must be at least 1")
     if args.rtc and (args.rtc_num_steps < 1 or not 1 <= args.rtc_min_execution_steps < 10):
         raise SafetyAbort("RTC requires positive denoising steps and min execution steps in 1..9")
     if args.rtc and (not math.isfinite(args.rtc_guidance_beta) or args.rtc_guidance_beta <= 0):
@@ -471,27 +533,57 @@ def validate_args(args):
         raise SafetyAbort("Gripper limits must satisfy 0 <= min < max <= 80 mm")
 
 
+def _load_sibling_recorder():
+    """Use this directory's writer even if another inference_recorder is on sys.path."""
+    path = Path(__file__).with_name("inference_recorder.py")
+    name = "rtc_stage_inference_recorder"
+    module = sys.modules.get(name)
+    if module is None:
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    return module.InferenceRecorder
+
+
+def _checkpoint_mean_state(args):
+    stats = json.loads(Path(args.norm_stats).read_text())["norm_stats"]
+    return np.asarray(stats["state"]["mean"], dtype=np.float32)
+
+
+def _live_or_offline_state(args, feedback, limits):
+    if feedback is not None:
+        return limits.validate_state(feedback.read())
+    if not getattr(args, "offline_dry_run", False):
+        raise SafetyAbort("RTC requires live robot feedback")
+    return limits.validate_state(_checkpoint_mean_state(args))
+
+
+def _record_step(recorder, limits, images, state, target, task):
+    recorded = np.array(target, dtype=np.float32, copy=True)
+    recorded[-1] = limits.gripper_mm(target) / 1000.0
+    recorder.record(images, state, recorded, task)
+
+
 def run_rtc_loop(args, client, feedback, cameras, formatter, limits, recorder=None):
     """Consume a chunk on control ticks while the next guided chunk is sampled."""
-    if feedback is None:
-        raise SafetyAbort("RTC requires live robot feedback")
 
     def observe():
         images = cameras.capture() if cameras else {
             name: np.zeros((224, 224, 3), dtype=np.uint8) for name in ("realsense_0", "realsense_1")
         }
-        state = limits.validate_state(feedback.read())
-        return state, prepare_observation(state, images, args.task, allow_constant_images=args.no_camera)
+        state = _live_or_offline_state(args, feedback, limits)
+        return state, images, prepare_observation(state, images, args.task, allow_constant_images=args.no_camera)
 
     arm = None
     calls = steps = 0
     latencies = []
     period = 1.0 / args.fps
-    state, observation = observe()
+    state, images, observation = observe()
     observation["rtc"] = {"num_steps": args.rtc_num_steps}
     print("[RTC] Warming policy before opening the robot command channel", flush=True)
     client.infer(observation, args.first_action_timeout_s)
-    state, observation = observe()
+    state, images, observation = observe()
     observation["rtc"] = {"num_steps": args.rtc_num_steps}
     started = time.monotonic()
     actions = action_array(client.infer(observation, args.first_action_timeout_s))
@@ -517,7 +609,7 @@ def run_rtc_loop(args, client, feedback, cameras, formatter, limits, recorder=No
                     raise SafetyAbort(f"RTC action shape changed from {actions.shape} to {replacement.shape}")
                 if sent_during_inference >= horizon:
                     raise SafetyAbort("RTC inference arrived after the entire active chunk was executed")
-                current_state = limits.validate_state(feedback.read())
+                current_state = _live_or_offline_state(args, feedback, limits)
                 limits.validate_actions(replacement[sent_during_inference:], current_state)
                 actions = replacement
                 index = sent_during_inference
@@ -534,7 +626,7 @@ def run_rtc_loop(args, client, feedback, cameras, formatter, limits, recorder=No
                         f"RTC latency needs {delay_steps} steps, but only {overlap} remain; "
                         "reduce inference latency or controller frequency"
                     )
-                _, observation = observe()
+                _, images, observation = observe()
                 observation["rtc"] = {
                     "previous_actions": actions[index:].copy(),
                     "executed_steps": index,
@@ -554,8 +646,7 @@ def run_rtc_loop(args, client, feedback, cameras, formatter, limits, recorder=No
                 break
 
             target = actions[index]
-            step_images = cameras.capture() if recorder is not None else None
-            step_state = limits.validate_state(feedback.read())
+            step_state = _live_or_offline_state(args, feedback, limits)
             limits.validate_actions(target[None, :], step_state)
             grip_mm = limits.gripper_mm(target)
             kwargs = dict(max_distance=args.gripper_max_distance, min_distance=args.gripper_min_distance)
@@ -568,6 +659,8 @@ def run_rtc_loop(args, client, feedback, cameras, formatter, limits, recorder=No
                     )
                     print(f"[RTC][RPC] dry-run would send: {command}", flush=True)
             else:
+                if formatter is None:
+                    raise SafetyAbort("RTC hardware control requires the robot SDK")
                 if arm is None:
                     arm = formatter
                     arm.connect()
@@ -578,7 +671,8 @@ def run_rtc_loop(args, client, feedback, cameras, formatter, limits, recorder=No
                 if not sent:
                     raise SafetyAbort("Robot rejected RTC motion command")
             if recorder is not None:
-                recorder.record(step_images, step_state, target, args.task)
+                step_images = cameras.capture() if cameras else images
+                _record_step(recorder, limits, step_images, step_state, target, args.task)
             steps += 1
             index += 1
             if future is not None:
@@ -596,9 +690,12 @@ def run_rtc_loop(args, client, feedback, cameras, formatter, limits, recorder=No
 
 
 def run(args):
-    from tb6r5_policy_infer.hardware.tb6r5 import TB6R5Interface, validate_robot_sdk
-
     validate_args(args)
+    needs_robot_sdk = args.local_check or args.print_rpc or not args.offline_dry_run
+    if needs_robot_sdk:
+        from tb6r5_policy_infer.hardware.tb6r5 import TB6R5Interface, validate_robot_sdk
+    else:
+        TB6R5Interface = validate_robot_sdk = None
     if args.smoke_test:
         print("[OPENPI] Smoke-test: dry-run with black images and checkpoint mean state; no robot commands", flush=True)
     limits = SafetyLimits.load(
@@ -621,18 +718,20 @@ def run(args):
         if not args.no_camera:
             cameras = Cameras(args)
             cameras.start()
-        if not args.smoke_test:
+        if not (args.smoke_test or args.offline_dry_run):
             feedback = RobotFeedback(args)
             feedback.start()
         if args.record_dataset:
-            from inference_recorder import InferenceRecorder
+            InferenceRecorder = _load_sibling_recorder()
             recorder = InferenceRecorder(args.record_dataset, args.recorder_python,
                                          args.record_fps, args.record_episode_frames)
             print(f"[RECORD] LeRobotDataset: {recorder.root}", flush=True)
-        formatter = TB6R5Interface(
-            args.robot_ip, args.rpc_port, enable_topic=False, print_rpc=args.print_rpc,
-            g_model=args.g_model, cd_version=args.cd_version, subloop=args.subloop,
-        )
+        formatter = None
+        if TB6R5Interface is not None:
+            formatter = TB6R5Interface(
+                args.robot_ip, args.rpc_port, enable_topic=False, print_rpc=args.print_rpc,
+                g_model=args.g_model, cd_version=args.cd_version, subloop=args.subloop,
+            )
         if args.rtc:
             return run_rtc_loop(args, client, feedback, cameras, formatter, limits, recorder)
         calls, steps = 0, 0
@@ -661,7 +760,8 @@ def run(args):
             for target in actions[:args.n_action_steps]:
                 step_start = time.monotonic()
                 # Recheck live feedback after a possibly long model call, and before every command.
-                limits.validate_actions(target[None, :], feedback.read())
+                step_state = limits.validate_state(feedback.read()) if feedback is not None else state
+                limits.validate_actions(target[None, :], step_state)
                 grip_mm = limits.gripper_mm(target)
                 kwargs = dict(max_distance=args.gripper_max_distance, min_distance=args.gripper_min_distance)
                 if args.dry_run:
@@ -683,7 +783,7 @@ def run(args):
                     if not sent:
                         raise SafetyAbort("Robot rejected motion command")
                 if recorder is not None:
-                    recorder.record(images, state, target, args.task)
+                    _record_step(recorder, limits, images, step_state, target, args.task)
                 steps += 1
                 time.sleep(max(0, 1 / args.fps - (time.monotonic() - step_start)))
         mode = "pipeline smoke-test" if args.smoke_test else ("dry-run" if args.dry_run else "hardware")

@@ -3,36 +3,22 @@
 The controller supplies the unexecuted tail of its current chunk.  These
 helpers implement the soft mask and the flow-matching guidance term from
 Black et al., *Real-Time Execution of Action Chunking Flow Policies*.
+The scalar formulas live in ``openpi.models.rtc_guidance`` and are shared
+with the JAX sampler.
 """
-
-import math
 
 import torch
 
+from openpi.models.rtc_guidance import guidance_scale_value
+from openpi.models.rtc_guidance import soft_mask_weights
+
 
 def soft_mask(horizon: int, executed_steps: int, delay_steps: int, *, device) -> torch.Tensor:
-    if not 0 < executed_steps < horizon:
-        raise ValueError("RTC executed_steps must be between 1 and horizon - 1")
-    overlap = horizon - executed_steps
-    if not 0 <= delay_steps <= overlap:
-        raise ValueError("RTC delay_steps exceeds the remaining action overlap")
-    weights = torch.zeros(horizon, dtype=torch.float32, device=device)
-    weights[:delay_steps] = 1.0
-    for i in range(delay_steps, overlap):
-        c = (overlap - i) / (overlap - delay_steps + 1)
-        weights[i] = math.expm1(c) / math.expm1(1.0)
-    return weights
+    return torch.tensor(soft_mask_weights(horizon, executed_steps, delay_steps), dtype=torch.float32, device=device)
 
 
 def guidance_scale(time: float, beta: float = 5.0) -> float:
-    if not 0.0 <= time <= 1.0 or beta <= 0:
-        raise ValueError("Invalid RTC time or guidance limit")
-    if time == 1.0 or time == 0.0:
-        return beta
-    # The paper's flow time runs noise -> data; OpenPI runs data -> noise.
-    paper_time = 1.0 - time
-    residual_variance = time**2 / (paper_time**2 + time**2)
-    return min(beta, time / (paper_time * residual_variance))
+    return guidance_scale_value(time, beta)
 
 
 def guided_euler_step(x_t, velocity_fn, time: float, num_steps: int, target, weights, beta: float = 5.0):

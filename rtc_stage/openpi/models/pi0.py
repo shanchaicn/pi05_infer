@@ -81,7 +81,7 @@ class Pi0(_model.BaseModel):
         img = nnx_bridge.ToNNX(
             _siglip.Module(
                 num_classes=paligemma_config.width,
-                variant="So400m/14",
+                variant=config.vision_variant,
                 pool_type="none",
                 scan=True,
                 dtype_mm=config.dtype,
@@ -277,3 +277,86 @@ class Pi0(_model.BaseModel):
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         return x_0
+
+    def sample_actions_rtc(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        previous_actions,
+        executed_steps: int,
+        delay_steps: int,
+        *,
+        num_steps: int = 5,
+        noise: at.Float[at.Array, "b ah ad"] | None = None,
+        guidance_beta: float = 5.0,
+    ) -> _model.Actions:
+        """Sample a chunk guided by the overlapping tail of the active chunk.
+
+        ``previous_actions`` is already normalized and padded to ``action_dim``.
+        Row zero is the next control tick.  The prefix KV cache is constant;
+        only the denoising variable is differentiated, matching the PyTorch sampler.
+        ``executed_steps``, ``delay_steps``, ``num_steps`` and ``guidance_beta`` must
+        be concrete so the soft mask can be built before the JIT trace.
+        """
+        from openpi.models.rtc_guidance import soft_mask_weights
+        from openpi.models.rtc_jax import guided_euler_step
+
+        if num_steps < 1:
+            raise ValueError("RTC num_steps must be positive")
+        observation = _model.preprocess_observation(None, observation, train=False)
+        horizon = self.action_horizon
+        batch_size = observation.state.shape[0]
+        overlap = horizon - int(executed_steps)
+        if tuple(previous_actions.shape) != (batch_size, overlap, self.action_dim):
+            raise ValueError(
+                f"RTC previous_actions shape {tuple(previous_actions.shape)} != {(batch_size, overlap, self.action_dim)}"
+            )
+        weights = jnp.asarray(
+            soft_mask_weights(horizon, int(executed_steps), int(delay_steps)), dtype=jnp.float32
+        )[None, :, None]
+        target = jnp.zeros((batch_size, horizon, self.action_dim), dtype=jnp.float32)
+        target = target.at[:, :overlap].set(jnp.asarray(previous_actions, dtype=jnp.float32))
+        if noise is None:
+            noise = jax.random.normal(rng, (batch_size, horizon, self.action_dim))
+        noise = jnp.asarray(noise, dtype=jnp.float32)
+
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+
+        def _stop(value):
+            return jax.lax.stop_gradient(value) if isinstance(value, jax.Array) else value
+
+        kv_cache = jax.tree.map(_stop, kv_cache)
+
+        def velocity(x_t, time_value):
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+                observation, x_t, jnp.broadcast_to(jnp.asarray(time_value, dtype=x_t.dtype), (batch_size,))
+            )
+            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+            prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+            full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
+            suffix_positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+            (_, suffix_out), _ = self.PaliGemma.llm(
+                [None, suffix_tokens],
+                mask=full_attn_mask,
+                positions=suffix_positions,
+                kv_cache=kv_cache,
+                adarms_cond=[None, adarms_cond],
+            )
+            return self.action_out_proj(suffix_out[:, -horizon:]).astype(jnp.float32)
+
+        x_t = noise
+        for step_index in range(int(num_steps)):
+            time_value = 1.0 - step_index / int(num_steps)
+            x_t = guided_euler_step(
+                x_t,
+                lambda x, time_value=time_value: velocity(x, time_value),
+                time_value,
+                int(num_steps),
+                target,
+                weights,
+                float(guidance_beta),
+            )
+        return x_t

@@ -1,9 +1,16 @@
 # π0.5 RTC staging on Jetson
 
-This staged implementation adds guided Real-Time Chunking to the PyTorch
-π0.5 policy. It leaves the original `/home/ai/pi0.5/pi05_infer` runner and
-port 8002 service unchanged. The staged service uses port 8012 and the same
-`pi05_pp_white_red_fft` checkpoint. JAX is not included.
+This staged implementation adds guided Real-Time Chunking to the π0.5 policy
+on both backends. PyTorch sampling lives in `openpi/models_pytorch/pi0_pytorch.py`
+(`sample_actions_rtc`). JAX sampling lives in `openpi/models/pi0.py` and is
+served by `jax_infer.py` (default port 8003), which loads this `rtc_stage`
+tree. The original port 8002 service is unchanged. The staged PyTorch service
+uses port 8012 and the same `pi05_pp_white_red_fft` checkpoint.
+
+`Policy.metadata["rtc_supported"]` is true for either backend when the loaded
+model implements `sample_actions_rtc`. The host runners (`openpi_runner.py` and
+`rtc_stage/openpi_runner.py`) accept that flag from a JAX or a PyTorch server.
+`--offline-dry-run` exercises recording and RTC without a robot.
 
 The policy accepts a WebSocket observation with an optional `rtc` object:
 
