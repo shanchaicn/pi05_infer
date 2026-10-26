@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+import http.client
 import importlib.util
 import json
 import math
@@ -193,8 +194,21 @@ class SafetyLimits:
         if self.action_space == "ee_pose":
             value[3:7] = checked_quaternion(value[3:7])
         low, high = self.bounds[kind]
+        if self.action_space == "ee_pose":
+            # q and -q encode the same rotation. Controllers may return the
+            # opposite sign from the dataset, so align to the checkpoint
+            # quaternion hemisphere before component-wise envelope checks.
+            training_center = (low[3:7] + high[3:7]) * .5
+            if float(np.dot(value[3:7], training_center)) < 0:
+                value[3:7] *= -1
         padding = np.maximum(high - low, .01) * self.margin
-        if np.any(value < low - padding) or np.any(value > high + padding):
+        outside = (value < low - padding) | (value > high + padding)
+        if self.action_space == "ee_pose":
+            # Quaternion components are coupled and q/-q are equivalent, so
+            # per-component quantile bounds can reject a valid nearby pose.
+            # Quaternion norm and per-step angular distance remain checked.
+            outside[3:7] = False
+        if np.any(outside):
             raise SafetyAbort(f"{kind} outside checkpoint training envelope: {value.tolist()}")
         return value
 
@@ -349,21 +363,35 @@ class Cameras:
         import cv2
         from tb6r5_policy_infer.camera import HttpCameraStream
 
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        deadline = time.monotonic() + self.args.camera_timeout_s
-        with opener.open(url, timeout=self.args.camera_timeout_s) as response:
-            buffer = b""
-            while time.monotonic() < deadline and len(buffer) < 4 * 1024 * 1024:
-                block = response.read1(8192)
-                if not block:
-                    break
-                buffer += block
-                jpeg = HttpCameraStream._extract_jpeg_bytes(buffer)
-                if jpeg:
-                    bgr = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
-                    if bgr is not None:
-                        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        raise SafetyAbort(f"No complete camera frame from {url}")
+        last_error = "no complete JPEG frame"
+        for attempt in range(1, self.args.camera_retries + 1):
+            try:
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                deadline = time.monotonic() + self.args.camera_timeout_s
+                with opener.open(url, timeout=self.args.camera_timeout_s) as response:
+                    buffer = b""
+                    while time.monotonic() < deadline and len(buffer) < 4 * 1024 * 1024:
+                        block = response.read1(8192)
+                        if not block:
+                            break
+                        buffer += block
+                        jpeg = HttpCameraStream._extract_jpeg_bytes(buffer)
+                        if jpeg:
+                            bgr = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+                            if bgr is not None:
+                                return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                last_error = "stream returned no complete JPEG frame"
+            except (TimeoutError, urllib.error.URLError, http.client.HTTPException, OSError) as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+            if attempt < self.args.camera_retries:
+                print(
+                    f"[CAMERA] {url} attempt {attempt}/{self.args.camera_retries} failed: "
+                    f"{last_error}; retrying",
+                    flush=True,
+                )
+        raise SafetyAbort(
+            f"Camera HTTP failed after {self.args.camera_retries} attempts: {url}: {last_error}"
+        )
 
     def capture(self):
         import cv2
@@ -425,6 +453,7 @@ def build_parser():
     parser.add_argument("--feedback-timeout-s", type=float, default=5)
     parser.add_argument("--feedback-max-age-s", type=float, default=.5)
     parser.add_argument("--camera-timeout-s", type=float, default=5)
+    parser.add_argument("--camera-retries", type=int, default=3)
     camera_group = parser.add_mutually_exclusive_group()
     for option in ("--camera-urls", "--camera-devices", "--camera-serials"):
         camera_group.add_argument(option)
@@ -466,6 +495,8 @@ def validate_args(args):
         raise SafetyAbort("Hardware requires real camera frames")
     if args.max_inference_calls < 0 or args.n_action_steps < 1:
         raise SafetyAbort("Invalid inference/action count")
+    if args.camera_retries < 1:
+        raise SafetyAbort("camera_retries must be at least 1")
     if args.rtc and (args.rtc_num_steps < 1 or not 1 <= args.rtc_min_execution_steps < 10):
         raise SafetyAbort("RTC requires positive denoising steps and min execution steps in 1..9")
     if args.rtc and (not math.isfinite(args.rtc_guidance_beta) or args.rtc_guidance_beta <= 0):
