@@ -1,0 +1,33 @@
+name: pi05-rtc
+
+services:
+  policy:
+    image: openpi_tb6r5_policy_server:orin-jp62
+    pull_policy: never
+    init: true
+    network_mode: host
+    runtime: nvidia
+    shm_size: 8gb
+    volumes:
+      - /home/ai/pi0.5/model/pytorch/pp_white_red/19999:/models/pi05_tb6r5:ro
+      - /home/ai/pi0.5/pi05_infer/cache/openpi:/openpi_assets
+      - /home/ai/pi0.5/pi05_infer/compat_serve_policy.py:/opt/tb6r5/compat_serve_policy.py:ro
+      - /home/ai/pi0.5/pi05_infer/rtc_stage/openpi:/app/src/openpi:ro
+      - /home/ai/pi0.5/pi05_infer/docker_source/scripts:/app/scripts:ro
+      - /home/ai/pi0.5/pi05_infer/docker_source/packages/openpi-client/src/openpi_client:/app/packages/openpi-client/src/openpi_client:ro
+    environment:
+      OPENPI_DATA_HOME: /openpi_assets
+      OPENPI_DISABLE_TORCH_COMPILE: "1"
+      OPENPI_RTC_HARDWARE_ALLOWED: ${OPENPI_RTC_HARDWARE_ALLOWED:-1}
+      JAX_PLATFORMS: cpu
+      IS_DOCKER: "true"
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    entrypoint: [python, /opt/tb6r5/compat_serve_policy.py]
+    command: ["--port", "8012", "policy:checkpoint", "--policy.config=pi05_pp_white_red_fft", "--policy.dir=/models/pi05_tb6r5"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8012/healthz', timeout=3).read()"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 5m

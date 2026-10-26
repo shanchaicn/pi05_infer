@@ -1,0 +1,43 @@
+services:
+  tb6r5_policy_server:
+    image: ${IMAGE_NAME:-openpi_tb6r5_policy_server:orin-jp62}
+    build:
+      context: ../..
+      dockerfile: scripts/docker/serve_policy.orin.Dockerfile
+      network: host
+      args:
+        BASE_IMAGE: ${ORIN_BASE_IMAGE:-nvcr.io/nvidia/pytorch@sha256:d4a2f7f873bf0bbb72c2b15dc07860369c760dfda2348859826947bc71a88248}
+    init: true
+    tty: true
+    restart: unless-stopped
+    network_mode: host
+    shm_size: 8gb
+    runtime: nvidia
+    stop_grace_period: 30s
+    volumes:
+      - ${CHECKPOINT_HOST_DIR:-/home/ai/pi0.5/pi05_infer/policy}:${CHECKPOINT_CONTAINER_DIR:-/models/pi05_tb6r5}:ro
+      - ${OPENPI_DATA_HOME:-/home/test/.cache/openpi}:/openpi_assets
+    environment:
+      OPENPI_DATA_HOME: /openpi_assets
+      OPENPI_DISABLE_TORCH_COMPILE: ${OPENPI_DISABLE_TORCH_COMPILE:-1}
+      JAX_PLATFORMS: cpu
+      IS_DOCKER: "true"
+      POLICY_PORT: ${POLICY_PORT:-8002}
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    command:
+      - --port
+      - ${POLICY_PORT:-8002}
+      - policy:checkpoint
+      - --policy.config=${POLICY_CONFIG:-pi05_tb6r5}
+      - --policy.dir=${CHECKPOINT_CONTAINER_DIR:-/models/pi05_tb6r5}
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import os,urllib.request; urllib.request.urlopen(f'http://127.0.0.1:{os.environ["POLICY_PORT"]}/healthz', timeout=3).read()
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 5m

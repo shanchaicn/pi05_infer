@@ -1,0 +1,28 @@
+# Run from the openpi root with:
+# docker compose --env-file scripts/docker/.env.tb6r5.example -f scripts/docker/compose.tb6r5.yml up --build
+services:
+  tb6r5_policy_server:
+    image: openpi_tb6r5_policy_server
+    build:
+      context: ../..
+      dockerfile: scripts/docker/serve_policy.Dockerfile
+    init: true
+    tty: true
+    network_mode: host
+    shm_size: 16gb
+    volumes:
+      - ../..:/app
+      - ${OPENPI_DATA_HOME:-~/.cache/openpi}:/openpi_assets
+    environment:
+      - OPENPI_DATA_HOME=/openpi_assets
+      - IS_DOCKER=true
+      - SERVER_ARGS=--port ${POLICY_PORT:-8000} policy:checkpoint --policy.config=${POLICY_CONFIG:-pi05_tb6r5} --policy.dir=${CHECKPOINT_DIR:-checkpoints/pi05_tb6r5/tb6r5_lora_3k/1500} ${EXTRA_SERVER_ARGS:-}
+
+    # Comment out this block if not running on a machine with GPUs.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

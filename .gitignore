@@ -1,0 +1,13 @@
+app/
+jax_gpu_build/
+policy/
+cache/
+jax-jax-v0.5.3/
+jax-jax-v0.5.3.tar.gz
+jax-wheels/
+__pycache__/
+*.pyc
+*.bak*
+*.log
+*.jpg
+.mcp.json

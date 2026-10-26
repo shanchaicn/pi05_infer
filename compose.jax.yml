@@ -1,0 +1,44 @@
+name: pi05-jax
+
+services:
+  tb6r5_jax_policy_server:
+    # The existing Orin image supports CPU checks. GPU use requires a compatible JAX CUDA image.
+    image: ${JAX_IMAGE:-openpi_tb6r5_policy_server:orin-jp62}
+    pull_policy: never
+    init: true
+    network_mode: host
+    runtime: nvidia
+    shm_size: 8gb
+    volumes:
+      - ${JAX_CHECKPOINT_DIR:?Set JAX_CHECKPOINT_DIR to an OpenPI JAX checkpoint}:/models/pi05_tb6r5:ro
+      - ./jax_infer.py:/opt/tb6r5/jax_infer.py:ro
+      - ./app/src:/app/src:ro
+      - ./app/packages/openpi-client/src:/app/packages/openpi-client/src:ro
+      - ${OPENPI_DATA_HOME:-/home/ai/pi0.5/pi05_infer/cache/openpi}:/openpi_assets
+    environment:
+      OPENPI_ROOT: /app
+      OPENPI_DATA_HOME: /openpi_assets
+      JAX_PLATFORMS: ${JAX_DEVICE:-gpu}
+      XLA_PYTHON_CLIENT_PREALLOCATE: "false"
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      POLICY_PORT: ${JAX_POLICY_PORT:-8003}
+    entrypoint: [python, /opt/tb6r5/jax_infer.py]
+    command:
+      - serve
+      - --checkpoint=/models/pi05_tb6r5
+      - --config=${POLICY_CONFIG:?Set POLICY_CONFIG to the checkpoint training config}
+      - --device=${JAX_DEVICE:-gpu}
+      - --host=0.0.0.0
+      - --port=${JAX_POLICY_PORT:-8003}
+      - --num-steps=${JAX_NUM_STEPS:-10}
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import os,urllib.request; urllib.request.urlopen(f'http://127.0.0.1:{os.environ["POLICY_PORT"]}/healthz', timeout=3).read()
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 5m

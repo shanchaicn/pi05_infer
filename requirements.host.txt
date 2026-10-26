@@ -1,0 +1,10 @@
+# Verified in /home/ai/condaenv/openpi_orin on JetPack 6.2.1.
+# Keep the TB6-R5 binary SDK on Python 3.10 or 3.12.
+msgpack==1.2.1
+numpy==1.26.4
+opencv-python==4.11.0.86
+Pillow==12.3.0
+websockets==16.0
+
+# Optional, only for --camera-serials (direct USB RealSense):
+# pyrealsense2=<Jetson-compatible build>
