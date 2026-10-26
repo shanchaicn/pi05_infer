@@ -112,6 +112,28 @@ def checked_quaternion(value):
     return quat
 
 
+# pp_white_red stores 1280x720 cameras stretched to this 4:3 frame.
+TRAINING_FRAME_WIDTH = 640
+TRAINING_FRAME_HEIGHT = 480
+
+
+def match_training_frame(image):
+    """Stretch a live frame to the 640x480 image the dataset actually stored.
+
+    A direct resize from 1280x720 makes objects about 33% taller. The policy
+    then pads that 4:3 frame to 224. Sending the original 16:9 frame pads a
+    different canvas, so do the same stretch before padding.
+    """
+    import cv2
+
+    image = np.asarray(image)
+    if image.ndim != 3 or image.shape[2] != 3 or min(image.shape[:2]) < 1 or image.dtype != np.uint8:
+        raise SafetyAbort("Camera image must be a non-empty RGB uint8 HWC array")
+    if image.shape[0] == TRAINING_FRAME_HEIGHT and image.shape[1] == TRAINING_FRAME_WIDTH:
+        return image
+    return cv2.resize(image, (TRAINING_FRAME_WIDTH, TRAINING_FRAME_HEIGHT), interpolation=cv2.INTER_LINEAR)
+
+
 def resize_with_pad(image, size=224):
     import cv2
 
@@ -139,7 +161,7 @@ def prepare_observation(state, images, task, *, allow_constant_images=False):
         if name not in images:
             raise SafetyAbort(f"Missing camera: {name}")
         raw = np.asarray(images[name])
-        image = resize_with_pad(raw)
+        image = resize_with_pad(match_training_frame(raw))
         if not allow_constant_images and (raw.max() == raw.min() or float(raw.std()) < 1):
             raise SafetyAbort(f"Camera {name} returned an empty/constant frame")
         observation[key] = image
