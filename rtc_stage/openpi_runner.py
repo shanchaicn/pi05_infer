@@ -118,20 +118,25 @@ TRAINING_FRAME_HEIGHT = 480
 
 
 def match_training_frame(image):
-    """Stretch a live frame to the 640x480 image the dataset actually stored.
+    """Reproduce the converter's PIL LANCZOS stretch to the stored 640x480 frame.
 
     A direct resize from 1280x720 makes objects about 33% taller. The policy
-    then pads that 4:3 frame to 224. Sending the original 16:9 frame pads a
-    different canvas, so do the same stretch before padding.
+    server applies the same OpenPI ResizeImages(224, 224) transform used during
+    training, so this client deliberately stops at the stored dataset size.
     """
-    import cv2
+    from PIL import Image
 
     image = np.asarray(image)
     if image.ndim != 3 or image.shape[2] != 3 or min(image.shape[:2]) < 1 or image.dtype != np.uint8:
         raise SafetyAbort("Camera image must be a non-empty RGB uint8 HWC array")
     if image.shape[0] == TRAINING_FRAME_HEIGHT and image.shape[1] == TRAINING_FRAME_WIDTH:
         return image
-    return cv2.resize(image, (TRAINING_FRAME_WIDTH, TRAINING_FRAME_HEIGHT), interpolation=cv2.INTER_LINEAR)
+    return np.asarray(
+        Image.fromarray(image, mode="RGB").resize(
+            (TRAINING_FRAME_WIDTH, TRAINING_FRAME_HEIGHT),
+            Image.Resampling.LANCZOS,
+        )
+    )
 
 
 def resize_with_pad(image, size=224):
@@ -161,7 +166,9 @@ def prepare_observation(state, images, task, *, allow_constant_images=False):
         if name not in images:
             raise SafetyAbort(f"Missing camera: {name}")
         raw = np.asarray(images[name])
-        image = resize_with_pad(match_training_frame(raw))
+        # Send the stored training resolution. The policy server owns the
+        # OpenPI ResizeImages(224, 224) transform for both training and inference.
+        image = match_training_frame(raw)
         if not allow_constant_images and (raw.max() == raw.min() or float(raw.std()) < 1):
             raise SafetyAbort(f"Camera {name} returned an empty/constant frame")
         observation[key] = image
@@ -185,8 +192,8 @@ class SafetyLimits:
     joint_step: float = .03
     tcp_step: float = .03
     rotation_step: float = .15
-    gripper_min_mm: float = 30
-    gripper_max_mm: float = 70
+    gripper_min_mm: float = 0
+    gripper_max_mm: float = 65
 
     @classmethod
     def load(cls, path, margin=.15, **kwargs):
@@ -393,7 +400,22 @@ class Cameras:
                 with opener.open(url, timeout=self.args.camera_timeout_s) as response:
                     buffer = b""
                     while time.monotonic() < deadline and len(buffer) < 4 * 1024 * 1024:
-                        block = response.read1(8192)
+                        try:
+                            block = response.read1(8192)
+                        except http.client.IncompleteRead as exc:
+                            # The robot MJPEG endpoint sometimes closes a chunked
+                            # response after sending complete JPEGs. Keep both the
+                            # bytes already accumulated and any reported partial
+                            # tail instead of discarding a usable frame.
+                            block = exc.partial or b""
+                            if block:
+                                buffer += block
+                            jpeg = HttpCameraStream._extract_jpeg_bytes(buffer)
+                            if jpeg:
+                                bgr = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+                                if bgr is not None:
+                                    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                            raise
                         if not block:
                             break
                         buffer += block
@@ -490,8 +512,8 @@ def build_parser():
     parser.add_argument("--joint-step-max-rad", type=float, default=.05)
     parser.add_argument("--ee-step-max-m", type=float, default=.05)
     parser.add_argument("--rotation-step-max-rad", type=float, default=.15)
-    parser.add_argument("--gripper-min-distance", type=float, default=30)
-    parser.add_argument("--gripper-max-distance", type=float, default=70)
+    parser.add_argument("--gripper-min-distance", type=float, default=0)
+    parser.add_argument("--gripper-max-distance", type=float, default=65)
     parser.add_argument("--g-model", type=int, choices=(2, 3), default=3)
     parser.add_argument("--cd-version", type=int, choices=(44, 45), default=45)
     parser.add_argument("--subloop", type=int, choices=(0, 1), default=0)

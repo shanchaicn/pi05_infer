@@ -29,7 +29,7 @@ JAX：    /home/ai/pi0.5/model/jax/pp_white_red/19999
 | 机器人 IP | `192.168.2.151` |
 | 机器人运动 RPC | `192.168.2.151:5868` |
 | 机器人 Topic 状态 | `tcp://192.168.2.151:19091` |
-| 相机 HTTP 服务 | `192.168.2.151:6888` |
+| 相机 HTTP 服务 | `192.168.11.11:6888` |
 | PyTorch 普通策略服务 | `8002` |
 | JAX 策略服务 | `8003` |
 | PyTorch RTC 策略服务 | `8012` |
@@ -41,7 +41,7 @@ JAX：    /home/ai/pi0.5/model/jax/pp_white_red/19999
 所有命令统一使用以下映射：
 
 ```bash
---camera-urls 'realsense_0=http://192.168.2.151:6888/RsCameraSensor/0/0/color,realsense_1=http://192.168.2.151:6888/RsCameraSensor/1/0/color'
+--camera-urls 'realsense_0=http://192.168.11.11:6888/RsCameraSensor/0/0/color,realsense_1=http://192.168.11.11:6888/RsCameraSensor/1/0/color'
 ```
 
 含义：
@@ -52,6 +52,17 @@ JAX：    /home/ai/pi0.5/model/jax/pp_white_red/19999
 | `realsense_1` | `observation.images.wrist` | `/RsCameraSensor/1/0/color` |
 
 命令中必须使用纯 URL。不要复制聊天软件生成的 Markdown 链接，例如 `[http://...](http://...)`。
+
+当前两路 MJPEG URL 输出 640×360。训练源图是 1280×720；两者都是 16:9。转换脚本使用 Pillow `LANCZOS` 将其直接拉伸成 640×480。当前普通和 RTC runner 已在 `prepare_observation()` 中统一调用 `match_training_frame()`，执行同样的转换，然后将 640×480 图像发送给策略服务：
+
+```text
+客户端：16:9 RGB（当前 640×360）-> Pillow LANCZOS 640×480
+服务端：640×480 -> OpenPI ResizeImages(224,224)
+```
+
+最后一步由策略服务执行，因此训练和推理使用的是同一份 OpenPI `ResizeImages` 实现。客户端不再用 OpenCV 提前生成 224×224。这项处理不需要启动参数；当前代码没有 `--camera-preprocess` 参数。
+
+录制器会在推理之后另行把画面 resize 为 640×480，所以仅查看录制数据的 `meta/info.json` 不能证明当时模型实际收到的宽高比正确。
 
 ## 2. 推荐的终端和环境
 
@@ -81,10 +92,10 @@ cd /home/ai/pi0.5/pi05_infer
 
 ```bash
 curl --noproxy '*' -I --max-time 3 \
-  http://192.168.2.151:6888/RsCameraSensor/0/0/color
+  http://192.168.11.11:6888/RsCameraSensor/0/0/color
 
 curl --noproxy '*' -I --max-time 3 \
-  http://192.168.2.151:6888/RsCameraSensor/1/0/color
+  http://192.168.11.11:6888/RsCameraSensor/1/0/color
 ```
 
 两条命令应返回 `HTTP/1.1 200 OK` 和 `multipart/x-mixed-replace`。
@@ -96,7 +107,9 @@ runner 默认对每路 HTTP 相机最多尝试 3 次，每次等待 5 秒：
 --camera-retries 3
 ```
 
-短暂网络抖动时会打印 `[CAMERA] ... retrying` 并自动重试。如果 6888 端口可以连接但持续收不到任何字节，说明机器人侧相机 HTTP 发布服务没有输出画面；增加重试次数不能恢复服务，需要先恢复相机发布程序。
+短暂网络抖动时会打印 `[CAMERA] ... retrying` 并自动重试。当 HTTP multipart/JPEG 流在一帧尚未收完时断开，Python 可能报 `IncompleteRead(0 bytes read)`；当前 root 和 RTC runner 已将它与其他 `HTTPException` 一起按相机短断线处理并重试。这类错误是相机 HTTP 传输中断，不是 checkpoint 或归一化错误。
+
+如果 6888 端口可以连接但持续收不到任何字节，说明机器人侧相机 HTTP 发布服务没有输出画面；增加重试次数不能恢复服务，需要先恢复相机发布程序。
 
 ## 3. 动作安全阈值
 
@@ -125,6 +138,15 @@ runner 默认对每路 HTTP 相机最多尝试 3 次，每次等待 5 秒：
 - Topic 反馈是否存在或过期；
 - RTC 推理是否来得及覆盖当前动作块；
 - RPC 是否成功。
+
+训练数据的夹爪动作约为 0–70 mm；当前真机夹爪上限按实际配置设为 65 mm。192.168.2.151 上普通和 RTC runner 的默认值为：
+
+```bash
+--gripper-min-distance 0 \
+--gripper-max-distance 65
+```
+
+即使命令行省略上述两个参数，也会使用 0–65 mm。重跑 VLA 前仍应完成夹爪 65→40→10 mm 的独立长持测试。详细证据和测试顺序见同目录的 `PI05_真机失败排查报告.md`。
 
 ## 4. 启动 PyTorch 普通策略服务（8002）
 
@@ -237,7 +259,7 @@ cd /home/ai/pi0.5/pi05_infer
   --dry-run \
   --robot-ip 192.168.2.151 \
   --policy-port 8002 \
-  --camera-urls 'realsense_0=http://192.168.2.151:6888/RsCameraSensor/0/0/color,realsense_1=http://192.168.2.151:6888/RsCameraSensor/1/0/color' \
+  --camera-urls 'realsense_0=http://192.168.11.11:6888/RsCameraSensor/0/0/color,realsense_1=http://192.168.11.11:6888/RsCameraSensor/1/0/color' \
   --no-show-camera \
   --n-action-steps 10 \
   --max-inference-calls 3 \
@@ -259,7 +281,7 @@ cd /home/ai/pi0.5/pi05_infer
   --confirm-hardware TB6R5_REAL_INFERENCE \
   --robot-ip 192.168.2.151 \
   --policy-port 8002 \
-  --camera-urls 'realsense_0=http://192.168.2.151:6888/RsCameraSensor/0/0/color,realsense_1=http://192.168.2.151:6888/RsCameraSensor/1/0/color' \
+  --camera-urls 'realsense_0=http://192.168.11.11:6888/RsCameraSensor/0/0/color,realsense_1=http://192.168.11.11:6888/RsCameraSensor/1/0/color' \
   --no-show-camera \
   --fps 30 \
   --n-action-steps 10 \
@@ -311,7 +333,7 @@ cd /home/ai/pi0.5/pi05_infer
   --fps 1 \
   --robot-ip 192.168.2.151 \
   --policy-port 8012 \
-  --camera-urls 'realsense_0=http://192.168.2.151:6888/RsCameraSensor/0/0/color,realsense_1=http://192.168.2.151:6888/RsCameraSensor/1/0/color' \
+  --camera-urls 'realsense_0=http://192.168.11.11:6888/RsCameraSensor/0/0/color,realsense_1=http://192.168.11.11:6888/RsCameraSensor/1/0/color' \
   --no-show-camera \
   --max-inference-calls 3 \
   --joint-step-max-rad 0.1 \
@@ -335,7 +357,7 @@ cd /home/ai/pi0.5/pi05_infer
   --confirm-hardware TB6R5_REAL_INFERENCE \
   --robot-ip 192.168.2.151 \
   --policy-port 8012 \
-  --camera-urls 'realsense_0=http://192.168.2.151:6888/RsCameraSensor/0/0/color,realsense_1=http://192.168.2.151:6888/RsCameraSensor/1/0/color' \
+  --camera-urls 'realsense_0=http://192.168.11.11:6888/RsCameraSensor/0/0/color,realsense_1=http://192.168.11.11:6888/RsCameraSensor/1/0/color' \
   --no-show-camera \
   --max-inference-calls 0 \
   --joint-step-max-rad 0.1 \
@@ -398,7 +420,7 @@ OUT="/home/ai/pi0.5/data/lerobotdata/pi05_pt_rtc_$(date +%Y%m%d_%H%M%S)"
   --confirm-hardware TB6R5_REAL_INFERENCE \
   --robot-ip 192.168.2.151 \
   --policy-port 8012 \
-  --camera-urls 'realsense_0=http://192.168.2.151:6888/RsCameraSensor/0/0/color,realsense_1=http://192.168.2.151:6888/RsCameraSensor/1/0/color' \
+  --camera-urls 'realsense_0=http://192.168.11.11:6888/RsCameraSensor/0/0/color,realsense_1=http://192.168.11.11:6888/RsCameraSensor/1/0/color' \
   --no-show-camera \
   --max-inference-calls 0 \
   --joint-step-max-rad 0.1 \
@@ -423,7 +445,7 @@ OUT="/home/ai/pi0.5/data/lerobotdata/pi05_pt_normal_$(date +%Y%m%d_%H%M%S)"
   --confirm-hardware TB6R5_REAL_INFERENCE \
   --robot-ip 192.168.2.151 \
   --policy-port 8002 \
-  --camera-urls 'realsense_0=http://192.168.2.151:6888/RsCameraSensor/0/0/color,realsense_1=http://192.168.2.151:6888/RsCameraSensor/1/0/color' \
+  --camera-urls 'realsense_0=http://192.168.11.11:6888/RsCameraSensor/0/0/color,realsense_1=http://192.168.11.11:6888/RsCameraSensor/1/0/color' \
   --no-show-camera \
   --fps 30 \
   --n-action-steps 10 \
@@ -437,6 +459,8 @@ OUT="/home/ai/pi0.5/data/lerobotdata/pi05_pt_normal_$(date +%Y%m%d_%H%M%S)"
   --print-rpc \
   --task 'Pick up the red block and place it in the box on the left'
 ```
+
+
 
 ### 8.3 检查录制结果
 
@@ -729,7 +753,7 @@ cd /home/ai/pi0.5/pi05_infer
   --dry-run \
   --robot-ip 192.168.2.151 \
   --policy-port 8003 \
-  --camera-urls 'realsense_0=http://192.168.2.151:6888/RsCameraSensor/0/0/color,realsense_1=http://192.168.2.151:6888/RsCameraSensor/1/0/color' \
+  --camera-urls 'realsense_0=http://192.168.11.11:6888/RsCameraSensor/0/0/color,realsense_1=http://192.168.11.11:6888/RsCameraSensor/1/0/color' \
   --no-show-camera \
   --fps 30 \
   --n-action-steps 10 \
@@ -779,7 +803,7 @@ cd /home/ai/pi0.5/pi05_infer
   --fps 1 \
   --robot-ip 192.168.2.151 \
   --policy-port 8003 \
-  --camera-urls 'realsense_0=http://192.168.2.151:6888/RsCameraSensor/0/0/color,realsense_1=http://192.168.2.151:6888/RsCameraSensor/1/0/color' \
+  --camera-urls 'realsense_0=http://192.168.11.11:6888/RsCameraSensor/0/0/color,realsense_1=http://192.168.11.11:6888/RsCameraSensor/1/0/color' \
   --no-show-camera \
   --max-inference-calls 2 \
   --joint-step-max-rad 0.1 \
@@ -808,7 +832,7 @@ OUT="/home/ai/pi0.5/data/lerobotdata/pi05_jax_rtc_$(date +%Y%m%d_%H%M%S)"
   --confirm-hardware TB6R5_REAL_INFERENCE \
   --robot-ip 192.168.2.151 \
   --policy-port 8003 \
-  --camera-urls 'realsense_0=http://192.168.2.151:6888/RsCameraSensor/0/0/color,realsense_1=http://192.168.2.151:6888/RsCameraSensor/1/0/color' \
+  --camera-urls 'realsense_0=http://192.168.11.11:6888/RsCameraSensor/0/0/color,realsense_1=http://192.168.11.11:6888/RsCameraSensor/1/0/color' \
   --no-show-camera \
   --max-inference-calls 0 \
   --joint-step-max-rad 0.1 \
@@ -955,10 +979,10 @@ OUT="/home/ai/pi0.5/data/lerobotdata/pi05_run_$(date +%Y%m%d_%H%M%S)"
 
 ```bash
 curl --noproxy '*' -v --max-time 4 -o /dev/null \
-  http://192.168.2.151:6888/RsCameraSensor/0/0/color
+  http://192.168.11.11:6888/RsCameraSensor/0/0/color
 
 curl --noproxy '*' -v --max-time 4 -o /dev/null \
-  http://192.168.2.151:6888/RsCameraSensor/1/0/color
+  http://192.168.11.11:6888/RsCameraSensor/1/0/color
 ```
 
 如果 TCP 显示 `Connected`，但最后是 `0 bytes received`，机器人侧 6888 服务仍在监听却没有发布 MJPEG 帧。此时应恢复或重启机器人侧相机发布程序，再启动 runner。
