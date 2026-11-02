@@ -10,4 +10,14 @@ __pycache__/
 *.bak*
 *.log
 *.jpg
+*.pid
+*.swp
 .mcp.json
+
+# Local recovery copies and Python runtime artifacts.
+backup_camera_sdk_*/
+camera_topic_sdk/**/__pycache__/
+
+# CameraUpdatePb / Topic SDK is experimental and is not a supported runtime
+# path yet. Keep the vendor SDK local until its end-to-end stability is proven.
+camera_topic_sdk/

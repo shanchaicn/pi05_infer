@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import sys
 
 
@@ -17,4 +18,10 @@ from openpi_runner import main  # noqa: E402
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # The vendor Topic extension exposes start_subscriber but no shutdown API.
+    # After main() has explicitly disconnected RPC and closed all Python-owned
+    # resources, bypass its unsafe interpreter-finalization destructor.
+    exit_code = int(main() or 0)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(exit_code)

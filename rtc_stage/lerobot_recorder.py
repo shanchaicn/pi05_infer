@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import argparse
 import inspect
+import os
+import signal
+import socket
 import struct
 import sys
 
@@ -60,23 +63,44 @@ def read_packet(stream):
 
 
 def main():
+    def stop_recording(_signum, _frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, stop_recording)
+    signal.signal(signal.SIGTERM, stop_recording)
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True)
     parser.add_argument("--fps", type=int, default=10)
     parser.add_argument("--episode-frames", type=int, default=100)
+    parser.add_argument("--socket", help="Unix socket for independent sidecar recording")
     args = parser.parse_args()
     if args.fps < 1 or args.episode_frames < 1:
         parser.error("fps and episode-frames must be positive")
 
-    dataset = _create_dataset(args.root, args.fps)
+    root = os.path.abspath(os.path.expanduser(args.root))
+    if os.path.isdir(root) and os.listdir(root):
+        parser.error(f"recording directory is not empty: {root}")
+    # Finish the relatively expensive LeRobot import/initialization before the
+    # socket becomes visible to a live control loop.
+    dataset = _create_dataset(root, args.fps)
     pending = total = episodes = 0
-    print("READY", flush=True)
-    try:
-        while (packet := read_packet(sys.stdin.buffer)) is not None:
+    server = connection = stream = None
+    socket_path = None
+
+    def consume(input_stream):
+        nonlocal pending, total, episodes
+        while (packet := read_packet(input_stream)) is not None:
             if packet.get("kind") == "close":
-                break
+                return
             if packet.get("kind") != "frame":
                 raise ValueError("unknown recorder packet")
+            if args.socket and "_fps" in packet:
+                packet_fps = int(round(float(packet["_fps"])))
+                if packet_fps != args.fps:
+                    raise ValueError(
+                        f"recorder FPS={args.fps}, inference FPS={packet_fps}; "
+                        f"restart with FPS={packet_fps} ./record_one_episode.sh"
+                    )
             frame = {"task": packet["task"]}
             for key in ("observation.images.front", "observation.images.wrist"):
                 frame[key] = np.frombuffer(packet[key], dtype=np.uint8).reshape(FRAME_SHAPE).copy()
@@ -91,12 +115,52 @@ def main():
                 dataset.save_episode()
                 pending = 0
                 episodes += 1
-            print(f"OK {total} {episodes}", flush=True)
+            if not args.socket or total % 25 == 0:
+                print(f"[RECORD] frames={total}", flush=True) if args.socket else print(
+                    f"OK {total} {episodes}", flush=True
+                )
+
+    try:
+        if args.socket:
+            socket_path = os.path.abspath(os.path.expanduser(args.socket))
+            if os.path.exists(socket_path):
+                os.unlink(socket_path)
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(socket_path)
+            os.chmod(socket_path, 0o666)
+            server.listen(1)
+            print(f"READY {root}", flush=True)
+            while True:
+                print(f"[RECORD] waiting for inference at {socket_path}", flush=True)
+                connection, _ = server.accept()
+                stream = connection.makefile("rb")
+                print("[RECORD] inference connected; press Ctrl+C to save this episode", flush=True)
+                try:
+                    consume(stream)
+                finally:
+                    stream.close()
+                    connection.close()
+                    stream = connection = None
+                print(f"[RECORD] inference stage disconnected; retained {total} frames", flush=True)
+        else:
+            stream = sys.stdin.buffer
+            print("READY", flush=True)
+            consume(stream)
+    except KeyboardInterrupt:
+        print(f"[RECORD] stopping at {total} frames", flush=True)
     finally:
         if pending:
             dataset.save_episode()
             episodes += 1
-        print(f"SAVED {total} {episodes}", flush=True)
+        if stream is not None and stream is not sys.stdin.buffer:
+            stream.close()
+        if connection is not None:
+            connection.close()
+        if server is not None:
+            server.close()
+        if socket_path and os.path.exists(socket_path):
+            os.unlink(socket_path)
+        print(f"SAVED {total} {episodes} {root}", flush=True)
 
 
 if __name__ == "__main__":

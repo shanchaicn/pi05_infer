@@ -13,6 +13,8 @@ services:
       - /home/ai/pi0.5/pi05_infer/cache/openpi:/openpi_assets
       - /home/ai/pi0.5/pi05_infer/compat_serve_policy.py:/opt/tb6r5/compat_serve_policy.py:ro
       - /home/ai/pi0.5/pi05_infer/rtc_stage/openpi:/app/src/openpi:ro
+      # Overlay the training config that registers pi05_pp_white_red_h50.
+      - /home/ai/pi0.5/pi05_infer/app/src/openpi/training/config.py:/app/src/openpi/training/config.py:ro
       - /home/ai/pi0.5/pi05_infer/docker_source/scripts:/app/scripts:ro
       - /home/ai/pi0.5/pi05_infer/docker_source/packages/openpi-client/src/openpi_client:/app/packages/openpi-client/src/openpi_client:ro
     environment:
@@ -24,7 +26,7 @@ services:
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
     entrypoint: [python, /opt/tb6r5/compat_serve_policy.py]
-    command: ["--port", "8012", "policy:checkpoint", "--policy.config=pi05_pp_white_red_fft", "--policy.dir=/models/pi05_tb6r5"]
+    command: ["--port", "8012", "policy:checkpoint", "--policy.config=pi05_pp_white_red_h50", "--policy.dir=/models/pi05_tb6r5"]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8012/healthz', timeout=3).read()"]
       interval: 15s

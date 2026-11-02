@@ -499,7 +499,7 @@ class LeRobotTB6R5DataConfig(DataConfigFactory):
         # Data transforms: convert to model format + optional delta actions
         data_transforms = _transforms.Group(
             inputs=[tb6r5_policy.TB6R5Inputs(model_type=model_config.model_type)],
-            outputs=[tb6r5_policy.TB6R5Outputs(action_dim=8)],
+            outputs=[tb6r5_policy.TB6R5Outputs(action_dim=7)],
         )
 
         if self.use_delta_actions:
@@ -724,7 +724,7 @@ class TrainConfig:
 
 # Use `get_config` if you need to get a config by name in your code.
 _CONFIGS = [
-        TrainConfig(
+    TrainConfig(
         name="pi05_pp_white_red_fft",
         model=pi0_config.Pi0Config(
             pi05=True, action_dim=32, action_horizon=10,
@@ -751,7 +751,48 @@ _CONFIGS = [
         num_train_steps=30_000, log_interval=100, save_interval=1_000,
         keep_period=None, wandb_enabled=False,
     ),
-
+    TrainConfig(
+        name="pi05_pp_white_red_h50",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+            max_token_len=200,
+            discrete_state_input=True,
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+        ),
+        data=LeRobotPicoXRDataConfig(
+            repo_id="/data/pi05/datasets/pp_white_red",
+            assets=AssetsConfig(
+                assets_dir="/data/pi05/datasets/pp_white_red",
+                asset_id=".",
+            ),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        assets_base_dir="/data/pi05/training-assets",
+        checkpoint_base_dir="/data/pi05/training-checkpoints",
+        batch_size=8,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "/data/pi05/jax/cache/openpi/openpi-assets/checkpoints/pi05_base/params"
+        ),
+        pytorch_weight_path="/data/pi05/pi05_base_pytorch",
+        pytorch_training_precision="bfloat16",
+        num_train_steps=20_000,
+        log_interval=100,
+        save_interval=2_500,
+        keep_period=5_000,
+        wandb_enabled=False,
+    ),
     #
     # Inference Aloha configs.
     #

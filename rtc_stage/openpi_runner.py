@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parent
 PACKAGE_ROOT = Path(os.environ.get("TB6R5_PACKAGE_ROOT", ROOT.parent / "tb6r5_policy_infer"))
 for source in (
     PACKAGE_ROOT,
+    ROOT.parent,
     ROOT / "app/packages/openpi-client/src",
     ROOT.parent / "app/packages/openpi-client/src",
     ROOT.parent / "docker_source/packages/openpi-client/src",
@@ -102,6 +103,57 @@ def finite_vector(value, dim, name):
     return array.copy()
 
 
+def parse_xyz(value):
+    try:
+        xyz = np.asarray([float(part.strip()) for part in value.split(",")], dtype=np.float32)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("expected x,y,z in metres") from exc
+    if xyz.shape != (3,) or not np.all(np.isfinite(xyz)):
+        raise argparse.ArgumentTypeError("expected three finite values: x,y,z")
+    return xyz
+
+
+def quantize_gripper_actions(actions, args):
+    """Map model gripper semantics to two stable physical endpoints."""
+    actions = np.asarray(actions, dtype=np.float32).copy()
+    if not args.binary_gripper:
+        return actions
+    raw = actions[:, -1].copy()
+    actions[:, -1] = np.where(
+        raw < args.gripper_close_threshold_m,
+        args.gripper_close_command_m,
+        args.gripper_open_command_m,
+    )
+    return actions
+
+
+@dataclass
+class TaskCompletionDetector:
+    target_xyz: np.ndarray
+    radius_m: float
+    gripper_open_m: float
+    hold_steps: int
+    min_steps: int
+    require_grasp: bool
+    grasp_threshold_m: float
+    consecutive: int = 0
+    grasp_seen: bool = False
+
+    def update(self, state, executed_steps):
+        state = np.asarray(state, dtype=np.float32)
+        if state[-1] < self.grasp_threshold_m:
+            self.grasp_seen = True
+        distance = float(np.linalg.norm(state[:3] - self.target_xyz))
+        eligible = (
+            executed_steps >= self.min_steps
+            and distance <= self.radius_m
+            and float(state[-1]) > self.gripper_open_m
+            and (self.grasp_seen or not self.require_grasp)
+        )
+        self.consecutive = self.consecutive + 1 if eligible else 0
+        return self.consecutive >= self.hold_steps, distance
+
+
 def checked_quaternion(value):
     quat = finite_vector(value, 4, "quaternion")
     norm = np.linalg.norm(quat)
@@ -110,6 +162,31 @@ def checked_quaternion(value):
     quat /= norm
     # Keep the dataset quaternion sign; forcing w >= 0 can leave its training bounds.
     return quat
+
+
+def limit_quaternion_step(previous, target, max_angle):
+    """SLERP target toward previous so their geodesic angle is at most max_angle."""
+    previous = checked_quaternion(previous)
+    target = checked_quaternion(target)
+    dot = float(np.clip(np.dot(previous, target), -1.0, 1.0))
+    if dot < 0:
+        target = -target
+        dot = -dot
+    angle = 2.0 * math.acos(float(np.clip(dot, 0.0, 1.0)))
+    if angle <= max_angle:
+        return target, angle, False
+    fraction = max_angle / angle
+    half_angle = math.acos(float(np.clip(dot, 0.0, 1.0)))
+    sin_half = math.sin(half_angle)
+    if sin_half < 1e-6:
+        limited = previous + fraction * (target - previous)
+    else:
+        limited = (
+            math.sin((1.0 - fraction) * half_angle) / sin_half * previous
+            + math.sin(fraction * half_angle) / sin_half * target
+        )
+    limited /= np.linalg.norm(limited)
+    return limited.astype(np.float32), angle, True
 
 
 # pp_white_red stores 1280x720 cameras stretched to this 4:3 frame.
@@ -188,6 +265,7 @@ def action_array(result):
 class SafetyLimits:
     bounds: dict
     margin: float = .15
+    z_margin: float = .20
     action_space: str = "ee_pose"
     joint_step: float = .03
     tcp_step: float = .03
@@ -231,14 +309,26 @@ class SafetyLimits:
             if float(np.dot(value[3:7], training_center)) < 0:
                 value[3:7] *= -1
         padding = np.maximum(high - low, .01) * self.margin
-        outside = (value < low - padding) | (value > high + padding)
+        if self.action_space == "ee_pose":
+            padding[2] = max(high[2] - low[2], .01) * self.z_margin
+        lower = low - padding
+        upper = high + padding
+        outside = (value < lower) | (value > upper)
         if self.action_space == "ee_pose":
             # Quaternion components are coupled and q/-q are equivalent, so
             # per-component quantile bounds can reject a valid nearby pose.
             # Quaternion norm and per-step angular distance remain checked.
             outside[3:7] = False
         if np.any(outside):
-            raise SafetyAbort(f"{kind} outside checkpoint training envelope: {value.tolist()}")
+            names = ("x", "y", "z", "qx", "qy", "qz", "qw", "gripper") if self.action_space == "ee_pose" else tuple(
+                f"joint_{index}" for index in range(self.dimension - 1)
+            ) + ("gripper",)
+            details = ", ".join(
+                f"{names[index]}={value[index]:.6f} outside "
+                f"[{lower[index]:.6f}, {upper[index]:.6f}]"
+                for index in np.flatnonzero(outside)
+            )
+            raise SafetyAbort(f"{kind} outside checkpoint training envelope: {details}")
         return value
 
     def validate_actions(self, actions, state):
@@ -247,12 +337,26 @@ class SafetyLimits:
             raise SafetyAbort(f"Action dimension {actions.shape[1]} != checkpoint dimension {self.dimension}; no truncation or padding allowed")
         previous = self.validate_state(state)
         for index, raw in enumerate(actions):
+            if self.action_space == "ee_pose":
+                # The command path already enforces the physical gripper
+                # range.  Apply that limit before the statistical envelope so
+                # a harmless over-open prediction cannot reject the entire
+                # Cartesian action chunk.
+                raw[-1] = np.clip(
+                    raw[-1], self.gripper_min_mm / 1000.0, self.gripper_max_mm / 1000.0
+                )
             target = self.validate_state(raw, "actions")
             if self.action_space == "ee_pose":
                 distance = float(np.linalg.norm(target[:3] - previous[:3]))
-                angle = 2 * math.acos(float(np.clip(abs(np.dot(target[3:7], previous[3:7])), 0, 1)))
-                if distance > self.tcp_step or angle > self.rotation_step:
-                    raise SafetyAbort(f"Unsafe TCP jump at action {index}: {distance:.4f}m, {angle:.4f}rad")
+                limited_quat, angle, _ = limit_quaternion_step(
+                    previous[3:7], target[3:7], self.rotation_step
+                )
+                if distance > self.tcp_step:
+                    raise SafetyAbort(
+                        f"Unsafe TCP position jump at action {index}: {distance:.4f}m; "
+                        f"previous={previous[:3].tolist()}, target={target[:3].tolist()}"
+                    )
+                target[3:7] = limited_quat
             elif np.max(np.abs(target[:6] - previous[:6])) > self.joint_step:
                 raise SafetyAbort(f"Unsafe joint jump at action {index}")
             actions[index] = target
@@ -353,94 +457,118 @@ class RobotFeedback:
 
 
 class Cameras:
-    """Capture new frames for each observation; never reuse a cached failed frame."""
+    """Two-camera input from Topic SDK, local devices, RealSense, or HTTP."""
     def __init__(self, args):
         self.args = args
         self.sources = {}
         self.caps = {}
         self.realsense = None
+        self.http_stream = None
+        self.topic_camera = None
+        self.transport = ""
+
+    @staticmethod
+    def _parse_mapping(value, option):
+        result = {}
+        for entry in value.split(","):
+            if "=" not in entry:
+                raise SafetyAbort(f"{option} entries must be alias=value")
+            name, source = (part.strip() for part in entry.split("=", 1))
+            if not name or not source or name in result:
+                raise SafetyAbort(f"Invalid or duplicate {option} entry: {entry!r}")
+            result[name] = source
+        return result
+
+    def _start_http(self):
+        from tb6r5_policy_infer.camera import HttpCameraStream
+        self.http_stream = HttpCameraStream(
+            self.sources,
+            width=1280,
+            height=720,
+            fps=max(1, int(self.args.fps)),
+            timeout_s=self.args.camera_timeout_s,
+        )
+        self.http_stream.start()
+        self.http_stream.wait_ready(self.args.camera_timeout_s * self.args.camera_retries)
+        if set(self.http_stream.get_images()) != set(self.sources):
+            raise SafetyAbort("Not all HTTP cameras produced an initial frame")
+        self.transport = "HTTP MJPEG"
 
     def start(self):
         from tb6r5_policy_infer.camera import parse_camera_urls, parse_camera_devices, parse_camera_serials
 
         args = self.args
-        if args.camera_serials:
+        if args.camera_topic_sensors:
+            self.sources = self._parse_mapping(args.camera_topic_sensors, "--camera-topic-sensors")
+            try:
+                from camera_topic_sdk.robot_state.giant_frame_camera import GiantFrameCamera
+                self.topic_camera = GiantFrameCamera(args.robot_ip, self.sources, args.camera_topic_port)
+                self.topic_camera.start()
+                timeout = args.camera_timeout_s * args.camera_retries
+                if not self.topic_camera.wait_ready(timeout):
+                    raise RuntimeError(f"no complete two-camera frame within {timeout:g}s; diagnostics={self.topic_camera.diagnostics}")
+                self.transport = f"Topic SDK tcp://{args.robot_ip}:{args.camera_topic_port}"
+            except Exception as exc:
+                if self.topic_camera is not None:
+                    self.topic_camera.stop()
+                    self.topic_camera = None
+                if not args.camera_topic_fallback_http:
+                    raise SafetyAbort(f"Camera Topic SDK unavailable: {exc}") from exc
+                print(f"[CAMERA] Topic SDK unavailable, falling back to HTTP: {exc}", flush=True)
+                self.sources = {
+                    "realsense_0": f"http://{args.robot_ip}:6888/RsCameraSensor/0/0/color",
+                    "realsense_1": f"http://{args.robot_ip}:6888/RsCameraSensor/1/0/color",
+                }
+                self._start_http()
+        elif args.camera_serials:
             from tb6r5_policy_infer.hardware.realsense import RealSenseCameraInterface
-
             self.sources = parse_camera_serials(args.camera_serials, {})
             self.realsense = RealSenseCameraInterface(serial_numbers=list(self.sources.values()))
             self.realsense.start()
+            self.transport = "local RealSense SDK"
         elif args.camera_devices:
             import cv2
-
             self.sources = parse_camera_devices(args.camera_devices)
             for name, device in self.sources.items():
                 cap = cv2.VideoCapture(int(device) if device.isdigit() else device)
                 self.caps[name] = cap
                 if not cap.isOpened():
                     raise SafetyAbort(f"Cannot open camera {name}: {device}")
+            self.transport = "local video device"
         else:
             self.sources = parse_camera_urls(args.camera_urls) if args.camera_urls else {
-                "realsense_0": f"http://{args.robot_ip}:8888/RsCameraSensor/1/0/color",
-                "realsense_1": f"http://{args.robot_ip}:8888/RsCameraSensor/0/0/color",
+                "realsense_0": f"http://{args.robot_ip}:6888/RsCameraSensor/0/0/color",
+                "realsense_1": f"http://{args.robot_ip}:6888/RsCameraSensor/1/0/color",
             }
+            self._start_http()
         if set(self.sources) != {"realsense_0", "realsense_1"}:
             raise SafetyAbort("Camera names must be realsense_0 and realsense_1")
-        print(f"[OPENPI] Cameras: {self.sources}", flush=True)
-
-    def _http_image(self, url):
-        import cv2
-        from tb6r5_policy_infer.camera import HttpCameraStream
-
-        last_error = "no complete JPEG frame"
-        for attempt in range(1, self.args.camera_retries + 1):
-            try:
-                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-                deadline = time.monotonic() + self.args.camera_timeout_s
-                with opener.open(url, timeout=self.args.camera_timeout_s) as response:
-                    buffer = b""
-                    while time.monotonic() < deadline and len(buffer) < 4 * 1024 * 1024:
-                        try:
-                            block = response.read1(8192)
-                        except http.client.IncompleteRead as exc:
-                            # The robot MJPEG endpoint sometimes closes a chunked
-                            # response after sending complete JPEGs. Keep both the
-                            # bytes already accumulated and any reported partial
-                            # tail instead of discarding a usable frame.
-                            block = exc.partial or b""
-                            if block:
-                                buffer += block
-                            jpeg = HttpCameraStream._extract_jpeg_bytes(buffer)
-                            if jpeg:
-                                bgr = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
-                                if bgr is not None:
-                                    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                            raise
-                        if not block:
-                            break
-                        buffer += block
-                        jpeg = HttpCameraStream._extract_jpeg_bytes(buffer)
-                        if jpeg:
-                            bgr = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
-                            if bgr is not None:
-                                return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                last_error = "stream returned no complete JPEG frame"
-            except (TimeoutError, urllib.error.URLError, http.client.HTTPException, OSError) as exc:
-                last_error = f"{type(exc).__name__}: {exc}"
-            if attempt < self.args.camera_retries:
-                print(
-                    f"[CAMERA] {url} attempt {attempt}/{self.args.camera_retries} failed: "
-                    f"{last_error}; retrying",
-                    flush=True,
-                )
-        raise SafetyAbort(
-            f"Camera HTTP failed after {self.args.camera_retries} attempts: {url}: {last_error}"
-        )
+        print(f"[OPENPI] Cameras ({self.transport}): {self.sources}", flush=True)
 
     def capture(self):
         import cv2
 
-        if self.realsense is not None:
+        if self.topic_camera is not None:
+            deadline = time.monotonic() + self.args.camera_timeout_s * self.args.camera_retries
+            while True:
+                frames = self.topic_camera.get_frames()
+                now_ns = time.time_ns()
+                missing = set(self.sources) - set(frames)
+                stale = {
+                    name: (now_ns - frames[name]["timestamp_ns"]) / 1e9
+                    for name in frames if name in self.sources
+                    if (now_ns - frames[name]["timestamp_ns"]) / 1e9 > self.args.camera_max_age_s
+                }
+                if not missing and not stale:
+                    images = {name: frames[name]["image"] for name in self.sources}
+                    break
+                if time.monotonic() >= deadline:
+                    raise SafetyAbort(
+                        f"Camera Topic SDK unavailable: missing={sorted(missing)}, stale_seconds={stale}, "
+                        f"diagnostics={self.topic_camera.diagnostics}"
+                    )
+                time.sleep(.02)
+        elif self.realsense is not None:
             self.realsense.update_frames()
             frames = self.realsense.get_frames()
             images = {name: frames[serial]["color"] for name, serial in self.sources.items() if serial in frames}
@@ -452,9 +580,17 @@ class Cameras:
                     raise SafetyAbort(f"Camera disconnected: {name}")
                 images[name] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         else:
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                futures = {name: pool.submit(self._http_image, url) for name, url in self.sources.items()}
-                images = {name: future.result() for name, future in futures.items()}
+            deadline = time.monotonic() + self.args.camera_timeout_s * self.args.camera_retries
+            while True:
+                images = self.http_stream.get_images()
+                ages = self.http_stream.get_frame_ages()
+                missing = set(self.sources) - set(images)
+                stale = {name: ages.get(name, float("inf")) for name in self.sources if ages.get(name, float("inf")) > self.args.camera_max_age_s}
+                if not missing and not stale:
+                    break
+                if time.monotonic() >= deadline:
+                    raise SafetyAbort(f"HTTP camera unavailable: missing={sorted(missing)}, stale_seconds={stale}")
+                time.sleep(.02)
         if self.args.show_camera:
             for name, image in images.items():
                 cv2.imshow(name, cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
@@ -467,6 +603,10 @@ class Cameras:
             cap.release()
         if self.realsense is not None:
             self.realsense.stop()
+        if self.http_stream is not None:
+            self.http_stream.stop()
+        if self.topic_camera is not None:
+            self.topic_camera.stop()
         if self.args.show_camera:
             import cv2
             cv2.destroyAllWindows()
@@ -498,19 +638,50 @@ def build_parser():
     parser.add_argument("--feedback-max-age-s", type=float, default=.5)
     parser.add_argument("--camera-timeout-s", type=float, default=5)
     parser.add_argument("--camera-retries", type=int, default=3)
+    parser.add_argument("--camera-max-age-s", type=float, default=2.0)
     camera_group = parser.add_mutually_exclusive_group()
-    for option in ("--camera-urls", "--camera-devices", "--camera-serials"):
+    for option in ("--camera-urls", "--camera-devices", "--camera-serials", "--camera-topic-sensors"):
         camera_group.add_argument(option)
+    parser.add_argument("--camera-topic-port", type=int, default=19091)
+    parser.add_argument("--camera-topic-fallback-http", action="store_true", help="Fall back to robot HTTP MJPEG when no giant_frame_data Topic frames arrive")
     parser.add_argument("--norm-stats", type=Path, default=DEFAULT_POLICY_DIR / "assets/norm_stats.json")
     parser.add_argument("--action-space", choices=("ee_pose", "joints"), default="ee_pose")
     parser.add_argument("--fps", type=float, default=30)
     parser.add_argument("--n-action-steps", type=int, default=4)
     parser.add_argument("--rtc", action="store_true", help="Asynchronous guided Real-Time Chunking (JAX or PyTorch server)")
+    parser.add_argument("--rtc-warmup-only", action="store_true", help="Compile and validate RTC shapes, then exit before the control loop")
     parser.add_argument("--rtc-num-steps", type=int, default=5)
     parser.add_argument("--rtc-min-execution-steps", type=int, default=2)
     parser.add_argument("--rtc-guidance-beta", type=float, default=5.0)
+    parser.add_argument(
+        "--rtc-latency-margin-steps",
+        type=int,
+        default=2,
+        help="Extra control ticks reserved beyond measured steady-state inference latency",
+    )
+    parser.add_argument(
+        "--rtc-latency-floor-s",
+        type=float,
+        default=0.0,
+        help="Known steady-state latency floor used to choose the first guided RTC shape",
+    )
+    parser.add_argument("--binary-gripper", action="store_true", help="Map model gripper output to closed/open endpoints")
+    parser.add_argument("--gripper-close-threshold-m", type=float, default=.035)
+    parser.add_argument("--gripper-close-command-m", type=float, default=0.0)
+    parser.add_argument("--gripper-open-command-m", type=float, default=.065)
+    parser.add_argument("--binary-gripper-resend-delta-mm", type=float, default=1.0, help="Do not resend the same binary endpoint within this distance")
+    parser.add_argument("--task-complete-tcp", type=parse_xyz, help="Completion target x,y,z in metres")
+    parser.add_argument("--task-complete-radius-m", type=float, default=.060)
+    parser.add_argument("--task-complete-gripper-open-m", type=float, default=.040)
+    parser.add_argument("--task-complete-hold-steps", type=int, default=5)
+    parser.add_argument("--task-complete-min-steps", type=int, default=30)
+    parser.add_argument("--task-complete-grace-steps", type=int, default=30, help="Feedback-only ticks allowed after the final action")
+    parser.add_argument("--task-complete-require-grasp", action="store_true")
+    parser.add_argument("--reuse-robot-enabled", action="store_true", help="Reconnect to a controller deliberately left enabled by the sequence")
+    parser.add_argument("--keep-robot-enabled", action="store_true", help="After verified task completion, disconnect RPC without Disable for sequence handoff")
     parser.add_argument("--joint-step-max-rad", type=float, default=.05)
     parser.add_argument("--ee-step-max-m", type=float, default=.05)
+    parser.add_argument("--ee-z-envelope-margin", type=float, default=.20)
     parser.add_argument("--rotation-step-max-rad", type=float, default=.15)
     parser.add_argument("--gripper-min-distance", type=float, default=0)
     parser.add_argument("--gripper-max-distance", type=float, default=65)
@@ -541,15 +712,42 @@ def validate_args(args):
         raise SafetyAbort("Invalid inference/action count")
     if args.camera_retries < 1:
         raise SafetyAbort("camera_retries must be at least 1")
-    if args.rtc and (args.rtc_num_steps < 1 or not 1 <= args.rtc_min_execution_steps < 10):
-        raise SafetyAbort("RTC requires positive denoising steps and min execution steps in 1..9")
+    if args.rtc and (args.rtc_num_steps < 1 or args.rtc_min_execution_steps < 1):
+        raise SafetyAbort("RTC requires positive denoising and minimum execution steps")
     if args.rtc and (not math.isfinite(args.rtc_guidance_beta) or args.rtc_guidance_beta <= 0):
         raise SafetyAbort("RTC guidance beta must be positive and finite")
+    if args.rtc and not 0 <= args.rtc_latency_margin_steps <= 10:
+        raise SafetyAbort("RTC latency margin steps must be between 0 and 10")
+    if args.rtc and not (math.isfinite(args.rtc_latency_floor_s) and 0 <= args.rtc_latency_floor_s <= 10):
+        raise SafetyAbort("RTC latency floor must be finite and between 0 and 10 seconds")
     if args.rtc and args.smoke_test:
         raise SafetyAbort("RTC needs a real-time observation and feedback stream")
+    if args.rtc_warmup_only and not (args.rtc and args.dry_run):
+        raise SafetyAbort("--rtc-warmup-only requires --rtc --dry-run")
+    if args.binary_gripper:
+        values = (
+            args.gripper_close_command_m,
+            args.gripper_close_threshold_m,
+            args.gripper_open_command_m,
+        )
+        if not all(math.isfinite(value) for value in values) or not (0 <= values[0] < values[1] < values[2] <= .080):
+            raise SafetyAbort("Binary gripper values must satisfy 0 <= close < threshold < open <= 0.080m")
+        if not math.isfinite(args.binary_gripper_resend_delta_mm) or args.binary_gripper_resend_delta_mm <= 0:
+            raise SafetyAbort("binary_gripper_resend_delta_mm must be positive")
+    if args.task_complete_tcp is not None:
+        if args.action_space != "ee_pose":
+            raise SafetyAbort("TCP task completion requires --action-space ee_pose")
+        if not (math.isfinite(args.task_complete_radius_m) and args.task_complete_radius_m > 0):
+            raise SafetyAbort("task_complete_radius_m must be positive")
+        if not (math.isfinite(args.task_complete_gripper_open_m) and 0 < args.task_complete_gripper_open_m <= .080):
+            raise SafetyAbort("task_complete_gripper_open_m must be in (0, 0.080]")
+        if args.task_complete_hold_steps < 1 or args.task_complete_min_steps < 0 or args.task_complete_grace_steps < args.task_complete_hold_steps:
+            raise SafetyAbort("Task completion hold/min steps are invalid")
     for name in ("fps", "first_action_timeout_s", "action_timeout_s", "feedback_timeout_s", "feedback_max_age_s", "camera_timeout_s", "joint_step_max_rad", "ee_step_max_m", "rotation_step_max_rad"):
         if not math.isfinite(getattr(args, name)) or getattr(args, name) <= 0:
             raise SafetyAbort(f"{name} must be positive and finite")
+    if not math.isfinite(args.ee_z_envelope_margin) or not .15 <= args.ee_z_envelope_margin <= .50:
+        raise SafetyAbort("ee_z_envelope_margin must be between 0.15 and 0.50")
     if not (math.isfinite(args.gripper_min_distance) and math.isfinite(args.gripper_max_distance)
             and 0 <= args.gripper_min_distance < args.gripper_max_distance <= 80):
         raise SafetyAbort("Gripper limits must satisfy 0 <= min < max <= 80 mm")
@@ -565,7 +763,7 @@ def _load_sibling_recorder():
         module = importlib.util.module_from_spec(spec)
         sys.modules[name] = module
         spec.loader.exec_module(module)
-    return module.InferenceRecorder
+    return module
 
 
 def _checkpoint_mean_state(args):
@@ -598,61 +796,217 @@ def run_rtc_loop(args, client, feedback, cameras, formatter, limits, recorder=No
         return state, images, prepare_observation(state, images, args.task, allow_constant_images=args.no_camera)
 
     arm = None
+    completion = None
+    task_completed = False
+    if args.task_complete_tcp is not None and not args.dry_run:
+        completion = TaskCompletionDetector(
+            target_xyz=args.task_complete_tcp,
+            radius_m=args.task_complete_radius_m,
+            gripper_open_m=args.task_complete_gripper_open_m,
+            hold_steps=args.task_complete_hold_steps,
+            min_steps=args.task_complete_min_steps,
+            require_grasp=args.task_complete_require_grasp,
+            grasp_threshold_m=args.gripper_close_threshold_m,
+        )
+        print(
+            f"[TASK] completion target={completion.target_xyz.tolist()}, radius={completion.radius_m:.3f}m, "
+            f"gripper>{completion.gripper_open_m:.3f}m, hold={completion.hold_steps}, "
+            f"require_grasp={completion.require_grasp}",
+            flush=True,
+        )
     calls = steps = 0
     latencies = []
     period = 1.0 / args.fps
     state, images, observation = observe()
     observation["rtc"] = {"num_steps": args.rtc_num_steps}
     print("[RTC] Warming policy before opening the robot command channel", flush=True)
+    started = time.monotonic()
     client.infer(observation, args.first_action_timeout_s)
+    first_policy_latency = time.monotonic() - started
+    # Always obtain the actual initial chunk from a fresh observation after
+    # warmup.  This keeps cold and cached runs behaviorally identical.
     state, images, observation = observe()
     observation["rtc"] = {"num_steps": args.rtc_num_steps}
     started = time.monotonic()
-    actions = action_array(client.infer(observation, args.first_action_timeout_s))
-    latencies.append(time.monotonic() - started)
+    initial_result = client.infer(observation, args.first_action_timeout_s)
+    policy_latency = time.monotonic() - started
+    print(
+        f"[RTC] Policy ready: first={first_policy_latency:.3f}s, steady={policy_latency:.3f}s",
+        flush=True,
+    )
+    actions = quantize_gripper_actions(action_array(initial_result), args)
+    latencies.append(policy_latency)
     actions = limits.validate_actions(actions, state)
     horizon = len(actions)
-    if horizon != 10:
-        raise SafetyAbort(f"RTC expected this checkpoint's 10-step horizon; received {horizon}")
+    if horizon < 2:
+        raise SafetyAbort(f"RTC requires an action horizon of at least 2; received {horizon}")
+    if args.rtc_min_execution_steps >= horizon:
+        raise SafetyAbort(
+            f"RTC minimum execution steps must be smaller than the checkpoint horizon "
+            f"({args.rtc_min_execution_steps} >= {horizon})"
+        )
+    # executed_steps and delay_steps are static JAX arguments.  Changing either
+    # one while the robot is moving causes another compilation and can exhaust
+    # the active chunk.  Pick one conservative pair, compile it before opening
+    # the command channel, and keep it fixed for the session.
+    budget_latency = max(max(latencies), args.rtc_latency_floor_s)
+    fixed_delay = math.ceil(budget_latency * args.fps) + 1 + args.rtc_latency_margin_steps
+    request_steps = max(args.rtc_min_execution_steps, fixed_delay + 2)
+    for warm_attempt in range(1, 4):
+        overlap = horizon - request_steps
+        if request_steps >= horizon or fixed_delay > overlap:
+            raise SafetyAbort(
+                f"RTC needs request_step={request_steps}, delay={fixed_delay} for a {horizon}-step "
+                "horizon; reduce controller frequency"
+            )
+        _, _, warm_observation = observe()
+        warm_observation["rtc"] = {
+            "previous_actions": actions[request_steps:].copy(),
+            "executed_steps": request_steps,
+            "delay_steps": fixed_delay,
+            "num_steps": args.rtc_num_steps,
+            "guidance_beta": args.rtc_guidance_beta,
+        }
+        print(
+            f"[RTC] Warming guided sampler before opening the robot command channel "
+            f"(executed={request_steps}, delay={fixed_delay}, pass={warm_attempt})",
+            flush=True,
+        )
+        compile_started = time.monotonic()
+        warm_actions = action_array(client.infer(warm_observation, args.first_action_timeout_s))
+        compile_latency = time.monotonic() - compile_started
+        if warm_actions.shape != actions.shape:
+            raise SafetyAbort(f"RTC warmup action shape changed from {actions.shape} to {warm_actions.shape}")
+        # Always measure the compiled combination once more.  The first call
+        # may include XLA compilation; the second is the stable control budget.
+        steady_started = time.monotonic()
+        steady_actions = action_array(client.infer(warm_observation, args.first_action_timeout_s))
+        steady_latency = time.monotonic() - steady_started
+        if steady_actions.shape != actions.shape:
+            raise SafetyAbort(f"RTC steady warmup action shape changed from {actions.shape} to {steady_actions.shape}")
+        print(
+            f"[RTC] Guided sampler ready: first={compile_latency:.3f}s, "
+            f"steady={steady_latency:.3f}s",
+            flush=True,
+        )
+        latencies.append(steady_latency)
+        budget_latency = max(max(latencies), args.rtc_latency_floor_s)
+        required_delay = math.ceil(budget_latency * args.fps) + 1 + args.rtc_latency_margin_steps
+        required_request_steps = max(args.rtc_min_execution_steps, required_delay + 2)
+        if required_delay == fixed_delay and required_request_steps == request_steps:
+            break
+        fixed_delay = required_delay
+        request_steps = required_request_steps
+    else:
+        raise SafetyAbort("RTC warmup latency did not stabilize after 3 passes")
+    latencies = latencies[-10:]
+    print(
+        f"[RTC] Fixed session parameters: request_step={request_steps}, "
+        f"delay_budget={fixed_delay}, horizon={horizon}",
+        flush=True,
+    )
+    if args.rtc_warmup_only:
+        print(
+            f"[OK] RTC precompiled: request_step={request_steps}, "
+            f"delay_budget={fixed_delay}, horizon={horizon}",
+            flush=True,
+        )
+        return 0
     calls += 1
     index = 0
     future = None
     sent_during_inference = 0
+    completion_grace_steps = 0
     next_tick = time.monotonic()
-    print(f"[RTC] Initial chunk ready in {latencies[-1]:.3f}s; {horizon} actions at {args.fps:g} Hz", flush=True)
+    initial_motion = ""
+    if args.action_space == "ee_pose":
+        initial_motion = (
+            f"; state_z={state[2]:.4f}, first_z={actions[0, 2]:.4f}, "
+            f"end_z={actions[-1, 2]:.4f}"
+        )
+    print(
+        f"[RTC] Initial chunk ready in {latencies[-1]:.3f}s; {horizon} actions "
+        f"at {args.fps:g} Hz{initial_motion}",
+        flush=True,
+    )
     pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rtc-infer")
     try:
         while True:
             if future is not None and future.done():
                 latency = time.monotonic() - inference_started
-                replacement = action_array(future.result())
+                replacement = quantize_gripper_actions(action_array(future.result()), args)
                 future = None
                 if replacement.shape != actions.shape:
                     raise SafetyAbort(f"RTC action shape changed from {actions.shape} to {replacement.shape}")
                 if sent_during_inference >= horizon:
                     raise SafetyAbort("RTC inference arrived after the entire active chunk was executed")
+                if sent_during_inference > request_steps:
+                    raise SafetyAbort(
+                        f"RTC inference took {sent_during_inference} control steps, exceeding the "
+                        f"precompiled request step {request_steps}; reduce FPS"
+                    )
                 current_state = _live_or_offline_state(args, feedback, limits)
-                limits.validate_actions(replacement[sent_during_inference:], current_state)
+                raw_tail = replacement[sent_during_inference:].copy()
+                validated_tail = limits.validate_actions(raw_tail, current_state)
+                replacement[sent_during_inference:] = validated_tail
+                rotation_limited = 0
+                max_rotation_correction = 0.0
+                if args.action_space == "ee_pose":
+                    raw_quat = raw_tail[:, 3:7]
+                    raw_quat /= np.linalg.norm(raw_quat, axis=1, keepdims=True)
+                    dots = np.abs(np.sum(raw_quat * validated_tail[:, 3:7], axis=1))
+                    corrections = 2.0 * np.arccos(np.clip(dots, 0.0, 1.0))
+                    # Ignore sub-degree differences caused only by float32
+                    # normalization; report actual safety limiting.
+                    rotation_limited = int(np.count_nonzero(corrections > 1e-2))
+                    max_rotation_correction = float(np.max(corrections, initial=0.0))
                 actions = replacement
                 index = sent_during_inference
                 latencies.append(latency)
                 latencies = latencies[-10:]
-                print(f"[RTC] chunk {calls}: {latency:.3f}s; skipped {index} elapsed actions", flush=True)
-
-            if (future is None and index >= args.rtc_min_execution_steps
-                    and (not args.max_inference_calls or calls < args.max_inference_calls)):
-                delay_steps = math.ceil(max(latencies) * args.fps) + 1
-                overlap = horizon - index
-                if delay_steps > overlap:
-                    raise SafetyAbort(
-                        f"RTC latency needs {delay_steps} steps, but only {overlap} remain; "
-                        "reduce inference latency or controller frequency"
+                motion = ""
+                if args.action_space == "ee_pose":
+                    motion = (
+                        f"; state_z={current_state[2]:.4f}, next_z={actions[index, 2]:.4f}, "
+                        f"end_z={actions[-1, 2]:.4f}, rotation_limited={rotation_limited}, "
+                        f"max_correction={max_rotation_correction:.4f}rad"
                     )
+                print(
+                    f"[RTC] chunk {calls}: {latency:.3f}s; skipped {index} elapsed actions{motion}",
+                    flush=True,
+                )
+
+            step_state = None
+            if completion is not None:
+                step_state = _live_or_offline_state(args, feedback, limits)
+                complete, tcp_distance = completion.update(step_state, steps)
+                if completion.consecutive or complete:
+                    print(
+                        f"[TASK] completion candidate: tcp_distance={tcp_distance:.4f}m, "
+                        f"gripper={step_state[-1]:.4f}m, hold={completion.consecutive}/{completion.hold_steps}, "
+                        f"grasp_seen={completion.grasp_seen}",
+                        flush=True,
+                    )
+                if complete:
+                    task_completed = True
+                    print(
+                        f"[TASK] COMPLETE after {calls} inference calls and {steps} control steps",
+                        flush=True,
+                    )
+                    break
+
+            more_calls = not args.max_inference_calls or calls < args.max_inference_calls
+            if future is None and index > request_steps and more_calls:
+                raise SafetyAbort(
+                    f"RTC passed its fixed request step ({index} > {request_steps}); reduce FPS"
+                )
+            if future is None and index == request_steps and more_calls:
+                overlap = horizon - request_steps
                 _, images, observation = observe()
                 observation["rtc"] = {
-                    "previous_actions": actions[index:].copy(),
-                    "executed_steps": index,
-                    "delay_steps": delay_steps,
+                    "previous_actions": actions[request_steps:].copy(),
+                    "executed_steps": request_steps,
+                    "delay_steps": fixed_delay,
                     "num_steps": args.rtc_num_steps,
                     "guidance_beta": args.rtc_guidance_beta,
                 }
@@ -660,16 +1014,23 @@ def run_rtc_loop(args, client, feedback, cameras, formatter, limits, recorder=No
                 future = pool.submit(client.infer, observation, args.action_timeout_s)
                 sent_during_inference = 0
                 calls += 1
-                print(f"[RTC] Requested chunk {calls}, overlap={overlap}, delay_budget={delay_steps}", flush=True)
+                print(f"[RTC] Requested chunk {calls}, overlap={overlap}, delay_budget={fixed_delay}", flush=True)
 
             if index >= horizon:
                 if future is not None:
                     raise SafetyAbort("RTC active chunk exhausted before the next inference completed")
+                if completion is not None and completion_grace_steps < args.task_complete_grace_steps:
+                    completion_grace_steps += 1
+                    next_tick += period
+                    time.sleep(max(0.0, next_tick - time.monotonic()))
+                    continue
                 break
 
             target = actions[index]
-            step_state = _live_or_offline_state(args, feedback, limits)
-            limits.validate_actions(target[None, :], step_state)
+            if step_state is None:
+                step_state = _live_or_offline_state(args, feedback, limits)
+            target = limits.validate_actions(target[None, :], step_state)[0]
+            actions[index] = target
             grip_mm = limits.gripper_mm(target)
             kwargs = dict(max_distance=args.gripper_max_distance, min_distance=args.gripper_min_distance)
             if args.dry_run:
@@ -687,12 +1048,21 @@ def run_rtc_loop(args, client, feedback, cameras, formatter, limits, recorder=No
                     arm = formatter
                     arm.connect()
                     limits.validate_actions(target[None, :], feedback.read())
-                sent = (arm.set_cartesian_target_with_gripper(target[:3], target[3:7], grip_mm, cmd_delta=0, **kwargs)
+                    # Connecting and initializing the robot takes much longer
+                    # than one control period.  Start the control clock here so
+                    # the loop does not burst through stale ticks to catch up.
+                    next_tick = time.monotonic()
+                gripper_delta = args.binary_gripper_resend_delta_mm if args.binary_gripper else 0
+                sent = (arm.set_cartesian_target_with_gripper(target[:3], target[3:7], grip_mm, cmd_delta=gripper_delta, **kwargs)
                         if args.action_space == "ee_pose" else
-                        arm.set_joint_positions_with_gripper(target[:6], grip_mm, cmd_delta=0, **kwargs))
+                        arm.set_joint_positions_with_gripper(target[:6], grip_mm, cmd_delta=gripper_delta, **kwargs))
                 if not sent:
                     raise SafetyAbort("Robot rejected RTC motion command")
-            if recorder is not None:
+                if completion is not None and target[-1] <= args.gripper_close_command_m + 1e-6:
+                    # A commanded close is a more reliable grasp-cycle marker
+                    # than measured finger spacing, which depends on object width.
+                    completion.grasp_seen = True
+            if recorder is not None and recorder.is_active():
                 step_images = cameras.capture() if cameras else images
                 _record_step(recorder, limits, step_images, step_state, target, args.task)
             steps += 1
@@ -704,10 +1074,20 @@ def run_rtc_loop(args, client, feedback, cameras, formatter, limits, recorder=No
     finally:
         try:
             if arm is not None:
-                arm.disconnect()
+                arm.disconnect(disable=not (args.keep_robot_enabled and task_completed))
         finally:
             pool.shutdown(wait=True, cancel_futures=True)
-    print(f"[OK] RTC completed {calls} inference calls and {steps} control steps", flush=True)
+    if completion is not None and not task_completed:
+        raise SafetyAbort(
+            f"Task completion was not reached before the RTC call limit: "
+            f"target={completion.target_xyz.tolist()}, radius={completion.radius_m:.3f}m, "
+            f"gripper>{completion.gripper_open_m:.3f}m"
+        )
+    print(
+        f"[OK] RTC completed {calls} inference calls and {steps} control steps"
+        + (" (task completion detected)" if task_completed else ""),
+        flush=True,
+    )
     return 0
 
 
@@ -724,6 +1104,7 @@ def run(args):
         args.norm_stats, action_space=args.action_space,
         joint_step=args.joint_step_max_rad, tcp_step=args.ee_step_max_m,
         rotation_step=args.rotation_step_max_rad,
+        z_margin=args.ee_z_envelope_margin,
         gripper_min_mm=args.gripper_min_distance, gripper_max_mm=args.gripper_max_distance,
     )
     if args.local_check:
@@ -731,6 +1112,7 @@ def run(args):
         print(f"[OK] Host dependencies, RPC/Topic SDK and {limits.dimension}D normalization statistics")
         return 0
     client = feedback = cameras = arm = recorder = None
+    task_completed = False
     try:
         client = PolicyClient(args.policy_host, args.policy_port, args.first_action_timeout_s)
         validate_policy_server_metadata(client.metadata, dry_run=args.dry_run)
@@ -743,20 +1125,46 @@ def run(args):
         if not (args.smoke_test or args.offline_dry_run):
             feedback = RobotFeedback(args)
             feedback.start()
+        recorder_module = _load_sibling_recorder()
         if args.record_dataset:
-            InferenceRecorder = _load_sibling_recorder()
-            recorder = InferenceRecorder(args.record_dataset, args.recorder_python,
-                                         args.record_fps, args.record_episode_frames)
+            recorder = recorder_module.InferenceRecorder(
+                args.record_dataset, args.recorder_python,
+                args.record_fps, args.record_episode_frames,
+            )
             print(f"[RECORD] LeRobotDataset: {recorder.root}", flush=True)
+        else:
+            recorder = recorder_module.SidecarRecorder(fps=args.fps)
         formatter = None
         if TB6R5Interface is not None:
             formatter = TB6R5Interface(
                 args.robot_ip, args.rpc_port, enable_topic=False, print_rpc=args.print_rpc,
                 g_model=args.g_model, cd_version=args.cd_version, subloop=args.subloop,
+                reuse_enabled=args.reuse_robot_enabled,
             )
         if args.rtc:
-            return run_rtc_loop(args, client, feedback, cameras, formatter, limits, recorder)
+            result = run_rtc_loop(args, client, feedback, cameras, formatter, limits, recorder)
+            # run_rtc_loop owns and has already disconnected this command
+            # channel, possibly leaving the controller enabled for handoff.
+            arm = None
+            return result
         calls, steps = 0, 0
+        completion = None
+        if args.task_complete_tcp is not None and not args.dry_run:
+            completion = TaskCompletionDetector(
+                target_xyz=args.task_complete_tcp,
+                radius_m=args.task_complete_radius_m,
+                gripper_open_m=args.task_complete_gripper_open_m,
+                hold_steps=args.task_complete_hold_steps,
+                min_steps=args.task_complete_min_steps,
+                require_grasp=args.task_complete_require_grasp,
+                grasp_threshold_m=args.gripper_close_threshold_m,
+            )
+            print(
+                f"[TASK] completion target={completion.target_xyz.tolist()}, "
+                f"radius={completion.radius_m:.3f}m, gripper>{completion.gripper_open_m:.3f}m, "
+                f"hold={completion.hold_steps}, require_grasp={completion.require_grasp}",
+                flush=True,
+            )
         max_calls = args.max_inference_calls or (1 if args.smoke_test else 0)
         while not max_calls or calls < max_calls:
             images = cameras.capture() if cameras else {name: np.zeros((224, 224, 3), dtype=np.uint8) for name in ("realsense_0", "realsense_1")}
@@ -783,6 +1191,23 @@ def run(args):
                 step_start = time.monotonic()
                 # Recheck live feedback after a possibly long model call, and before every command.
                 step_state = limits.validate_state(feedback.read()) if feedback is not None else state
+                if completion is not None:
+                    complete, tcp_distance = completion.update(step_state, steps)
+                    if completion.consecutive or complete:
+                        print(
+                            f"[TASK] completion candidate: tcp_distance={tcp_distance:.4f}m, "
+                            f"gripper={step_state[-1]:.4f}m, "
+                            f"hold={completion.consecutive}/{completion.hold_steps}, "
+                            f"grasp_seen={completion.grasp_seen}",
+                            flush=True,
+                        )
+                    if complete:
+                        task_completed = True
+                        print(
+                            f"[TASK] COMPLETE after {calls} inference calls and {steps} control steps",
+                            flush=True,
+                        )
+                        break
                 limits.validate_actions(target[None, :], step_state)
                 grip_mm = limits.gripper_mm(target)
                 kwargs = dict(max_distance=args.gripper_max_distance, min_distance=args.gripper_min_distance)
@@ -804,18 +1229,51 @@ def run(args):
                         sent = arm.set_joint_positions_with_gripper(target[:6], grip_mm, cmd_delta=0, **kwargs)
                     if not sent:
                         raise SafetyAbort("Robot rejected motion command")
-                if recorder is not None:
+                if recorder is not None and recorder.is_active():
                     _record_step(recorder, limits, images, step_state, target, args.task)
                 steps += 1
                 time.sleep(max(0, 1 / args.fps - (time.monotonic() - step_start)))
+            if task_completed:
+                break
+        if completion is not None and not task_completed:
+            for _ in range(args.task_complete_grace_steps):
+                started = time.monotonic()
+                step_state = limits.validate_state(feedback.read())
+                complete, tcp_distance = completion.update(step_state, steps)
+                if completion.consecutive or complete:
+                    print(
+                        f"[TASK] completion candidate: tcp_distance={tcp_distance:.4f}m, "
+                        f"gripper={step_state[-1]:.4f}m, "
+                        f"hold={completion.consecutive}/{completion.hold_steps}, "
+                        f"grasp_seen={completion.grasp_seen}",
+                        flush=True,
+                    )
+                if complete:
+                    task_completed = True
+                    print(
+                        f"[TASK] COMPLETE after {calls} inference calls and {steps} control steps",
+                        flush=True,
+                    )
+                    break
+                time.sleep(max(0, 1 / args.fps - (time.monotonic() - started)))
+        if completion is not None and not task_completed:
+            raise SafetyAbort(
+                f"Task completion was not reached before the non-RTC call limit: "
+                f"target={completion.target_xyz.tolist()}, radius={completion.radius_m:.3f}m, "
+                f"gripper>{completion.gripper_open_m:.3f}m"
+            )
         mode = "pipeline smoke-test" if args.smoke_test else ("dry-run" if args.dry_run else "hardware")
-        print(f"[OK] Completed {calls} inference calls ({mode})", flush=True)
+        print(
+            f"[OK] Completed {calls} inference calls ({mode})"
+            + (" (task completion detected)" if task_completed else ""),
+            flush=True,
+        )
         return 0
     finally:
         # Disable the robot even if another resource's cleanup raises.
         try:
             if arm is not None:
-                arm.disconnect()
+                arm.disconnect(disable=not (args.keep_robot_enabled and task_completed))
         finally:
             try:
                 if feedback is not None:
