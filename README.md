@@ -1,244 +1,118 @@
-# TB6-R5 pi0.5 inference runtime
+# pi0.5 在 TB6-R5 上的推理
 
-For standalone JAX inference in this directory, use `jax_infer.py` and
-`compose.jax.yml`; see [the JAX guide](README_JAX.md). This path loads JAX
-`params/` explicitly and is independent of the PyTorch host bridge.
-The deployment commands below describe the existing PyTorch runtime.
+本仓库提供 `pi05_pp_white_red_h50` 的 JAX / PyTorch 推理服务、真机客户端、RTC 三段任务脚本和 LeRobot 录制入口。当前模型预测 50 步，训练数据的动作表示为 8 维 TCP 位姿及夹爪距离。真机运行前先检查相机、机器人状态和动作方向。
 
-This directory restores the Orin deployment split used by the trained OpenPI
-pi0.5 policy:
+## 代码与第三方依赖
 
-```text
-TB6-R5 state + two cameras
-              |
-              v
-run_pi05_tb6r5.py (host: validation, safety, RPC)
-              |
-              | ws://127.0.0.1:8002
-              v
-openpi_tb6r5_policy_server:orin-jp62 (Docker: CUDA inference)
-```
+| 组件 | 本仓库位置或外部位置 | 用途 |
+| --- | --- | --- |
+| OpenPI RTC 源码 | `rtc_stage/openpi/` | JAX / PyTorch 模型及 RTC 采样；JAX Docker 挂载到 `/app/src/openpi` |
+| OpenPI WebSocket 客户端 | `docker_source/packages/openpi-client/src/openpi_client/` | 策略请求与消息序列化；Docker 挂载到 `/app/packages/openpi-client/src/openpi_client` |
+| 策略服务入口 | `jax_infer.py`、`docker_source/scripts/serve_policy.py` | 分别启动 JAX、PyTorch 服务 |
+| TB6-R5 机器人 SDK | 宿主机相邻目录 `/home/ai/pi0.5/tb6r5_policy_infer/` | Topic 状态、RPC 运动、HTTP 相机辅助代码；真机客户端需要，策略服务容器不需要 |
+| 模型权重 | `/home/ai/pi0.5/model/` | 不随 Git 仓库分发 |
 
-The host bridge lives in `openpi_runner.py` in this directory;
-`run_pi05_tb6r5.py` remains its command-line entry point. It reuses the robot
-SDK and camera helpers from the sibling `tb6r5_policy_infer` package. Set
-`TB6R5_PACKAGE_ROOT` if that package is installed elsewhere.
+OpenPI 上游项目：[Physical-Intelligence/openpi](https://github.com/Physical-Intelligence/openpi)。机器人 SDK 接口示例：[臻识控制器 Python SDK](https://gitee.com/zhenshi-controller-api-data/sdk_send_recevice_demo_py)。本仓库的 RTC 实现与配置经过本地改动，不能直接用上游最新版替换。`app/` 是本机另外一份 OpenPI 工作树，已被 Git 忽略；JAX Docker Compose 使用仓库内已跟踪的 `rtc_stage/openpi/`。机器人 SDK 的二进制扩展不在仓库中，部署新机器时需准备与宿主机 Python、架构匹配的版本。
 
-The installed shared package currently provides a LeRobot CLI; its CLI/API
-does not provide the OpenPI backend. Use the commands below directly.
-Start the model service with `./manage.sh start` before starting the bridge.
+## 当前模型和端口
 
-The running image's Python source has been exported to `docker_source/` and
-mounted read-only at the same paths inside the model container:
+| 后端 | 服务端口 | checkpoint | 客户端入口 |
+| --- | --- | --- | --- |
+| PyTorch | `8002` | `/home/ai/pi0.5/model/pytorch/pp_white_red/19999` | `run_pytorch.sh` |
+| JAX GPU | `8003` | `/home/ai/pi0.5/model/jax/pi05_pp_white_red_h50/19999` | `run_jax.sh`、`run_jax_rtc.sh` |
+| PyTorch RTC | `8012` | 同上 PyTorch checkpoint | `run_pytorch_rtc.sh` |
 
-| Host path | Container path |
-| --- | --- |
-| `docker_source/src/openpi` | `/app/src/openpi` |
-| `docker_source/scripts` | `/app/scripts` |
-| `docker_source/packages/openpi-client/src/openpi_client` | `/app/packages/openpi-client/src/openpi_client` |
+四个入口默认用 `ROBOT_IP=192.168.2.151` 拼出两路 HTTP 相机 URL，端口为 `6888`。机器人状态 Topic 用 `19091`，运动 RPC 用 `5868`。`CAMERA_MODE=sdk` 对应的 CameraUpdatePb / `giant_frame_data` 仍是实验路径，当前真机默认不使用；详情见 [真机与录制说明](PI05_RTC_LEROBOT_使用说明.md)。
 
-Edit these exported files to change the model service. The separate `app/`
-tree is not mounted into this container. Restart the model service after Python
-source edits; after changing mount definitions, run `./manage.sh start` to
-recreate it. `TB6R5Outputs(action_dim=8)` in
-`docker_source/src/openpi/training/config.py` selects the first eight action
-dimensions. The six-axis delta-action conversion is still enabled and must
-be checked against the checkpoint's training configuration before TCP control.
+## JAX RTC：宿主机 GPU 服务
 
-The default checkpoint uses `--action-space ee_pose`:
-`[x, y, z, qx, qy, qz, qw, gripper_m]`. The bridge reads the TCP pose from
-Topic and builds Cartesian `JogAnyC` commands. A 7D joint checkpoint requires
-`--action-space joints` and matching normalization statistics. Dimensions
-are checked exactly; outputs are never truncated or padded by the bridge.
-
-`--dry-run` opens only the read-only Topic subscriber and cameras; no robot RPC
-connection is opened. HTTP frames are fetched anew for every observation.
-Missing/stale feedback, invalid quaternions, out-of-envelope values, and unsafe
-position/orientation jumps abort before motion. Black-frame smoke tests only
-check the model connection and finite output, and do not validate actions for
-hardware use. The bridge does not automatically home the robot.
-
-## Placeholder before training finishes
-
-Do not use a partial `model.safetensors` as a checkpoint placeholder. The
-current `/home/ai/pi05_base_pytorch/model.safetensors` is truncated: its file
-size is about 1.20 GiB while its safetensors header describes about 13.47 GiB.
-`manage.sh check` validates this structural size before starting a real model.
-
-For API, Docker, websocket, and action-validation testing, start the safe mock
-policy instead:
+151 上 `/home/ai/condaenv/openpi/bin/python` 已能识别 JAX CUDA。终端一先启动策略服务；它只加载模型，不会连接运动 RPC：
 
 ```bash
 cd /home/ai/pi0.5/pi05_infer
-./manage.sh placeholder-start
-curl --noproxy '*' http://127.0.0.1:8002/healthz
+export OPENPI_ROOT=/home/ai/pi0.5/pi05_infer/rtc_stage
+export PYTHONPATH=/home/ai/pi0.5/pi05_infer/rtc_stage:/home/ai/pi0.5/pi05_infer/docker_source/packages/openpi-client/src
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+
+/home/ai/condaenv/openpi/bin/python jax_infer.py serve \
+  --checkpoint /home/ai/pi0.5/model/jax/pi05_pp_white_red_h50/19999 \
+  --config pi05_pp_white_red_h50 \
+  --asset-id . \
+  --device gpu \
+  --num-steps 10 \
+  --host 0.0.0.0 \
+  --port 8003 \
+  --allow-hardware
 ```
 
-The placeholder returns a ten-step action chunk that holds the current robot
-state. Its websocket metadata contains `placeholder=true`, and the host
-runner refuses it unless `--dry-run` is active. It cannot be enabled for real
-hardware even when the normal hardware confirmation string is supplied.
+如果需要后台运行，使用同一命令加 `nohup`、输出日志和 `&`；进程 PID 应记录到本地 `.pid` 文件（Git 已忽略）。不要在已有服务占用 `8003` 时重复启动。
 
-Stop it before switching to a completed checkpoint:
-
-```bash
-./manage.sh placeholder-stop
-
-# The active inference checkpoint is mounted from /home/ai/pi0.5/model/pytorch/pp_white_red/19999/:
-#   model.safetensors
-#   assets/norm_stats.json
-
-./manage.sh check
-./manage.sh start
-./manage.sh status
-```
-
-After the real service is healthy, run a no-camera dry-run first and then a
-real-camera dry-run before considering hardware control.
-
-The Docker image already contains OpenPI and the Jetson CUDA dependencies. It
-does not contain a checkpoint. The active checkpoint directory is
-`/home/ai/pi0.5/model/pytorch/pp_white_red/19999/` and must contain:
-
-```text
-/home/ai/pi0.5/model/pytorch/pp_white_red/19999/model.safetensors
-/home/ai/pi0.5/model/pytorch/pp_white_red/19999/assets/norm_stats.json
-```
-
-The host safety validator uses the same directory by default. To temporarily
-use another checkpoint's normalization statistics, pass `--norm-stats` to
-`run_pi05_tb6r5.py` or set `TB6R5_OPENPI_POLICY_DIR` for that command.
-
-`metadata.pt` and `optimizer.pt` are training files and are not required for inference.
-
-## 1. Check and start the policy server
-
-With the new checkpoint in `/home/ai/pi0.5/model/pytorch/pp_white_red/19999/`:
+终端二检查服务并先做 dry-run：
 
 ```bash
 cd /home/ai/pi0.5/pi05_infer
-./manage.sh check
-./manage.sh start
-./manage.sh status
+curl --noproxy '*' --fail http://127.0.0.1:8003/healthz
+./run_jax_rtc.sh
 ```
 
-To use a different checkpoint for one command without editing configuration,
-set `CHECKPOINT_HOST_DIR`. The container mount and `manage.sh` validation use
-the same value:
+确认相机映射、真实状态、动作和安全阈值后，执行三段红—白—红任务：
+
+```bash
+REAL=1 ./run_jax_rtc_red_white_red.sh
+```
+
+脚本先对 JAX RTC 做预热/编译，再以 `v60` 回到 `act_vla_0`，然后依次执行三段任务。每段通过真实 TCP 位置与夹爪反馈判断完成。默认 30 FPS 控制、50 步预测；`RTC_NUM_STEPS=4`、`RTC_MIN_EXECUTION_STEPS=1`、`RTC_GUIDANCE_BETA=10.0`。首次 JAX 编译可能明显慢于后续调用；预热阶段在机械臂动作之前。普通非 RTC 三段任务可用 `REAL=1 ./run_jax_red_white_red.sh`，其默认执行 horizon 为 25。
+
+## JAX RTC：Docker GPU 服务
+
+151 上已存在 `jax-orin:0.5.3-cuda` 镜像，并验证容器内 JAX 能识别 `CudaDevice(id=0)`。`compose.jax.yml` 默认使用这个镜像、JAX h50 checkpoint 和仓库内 RTC OpenPI / WebSocket 客户端代码。它监听 `8003`，与上面的宿主机服务二选一。镜像通过 `jax_gpu_build/Dockerfile.runtime` 在目标 Jetson 上构建；该构建目录包含本地轮子，没有纳入 Git，迁移到其他机器需要单独准备兼容的镜像。
+
+如果 `docker ps` 显示手工创建的 `pi05-jax-rtc` 正在使用 `8003`，它已经是可用的 GPU JAX 服务；无需再次执行 Compose。确实要切换为 Compose 管理时，先结束正在使用该服务的客户端，再停止并移除旧容器，然后执行下面的 `up` 命令。
 
 ```bash
 cd /home/ai/pi0.5/pi05_infer
-CHECKPOINT_HOST_DIR=/absolute/path/to/checkpoint ./manage.sh restart
+docker compose -f compose.jax.yml config
+docker compose -f compose.jax.yml up -d --wait
+docker compose -f compose.jax.yml logs -f tb6r5_jax_policy_server
 ```
 
-The Compose definition uses the existing image and never pulls or rebuilds it.
-Model loading can take several minutes; `manage.sh start` waits for `/healthz`.
-
-Useful operations:
+另开终端验证，再运行客户端：
 
 ```bash
-./manage.sh logs
-./manage.sh restart
-./manage.sh stop
+curl --noproxy '*' --fail http://127.0.0.1:8003/healthz
+./run_jax_rtc.sh
+REAL=1 ./run_jax_rtc_red_white_red.sh
 ```
 
-## 2. Safe pipeline tests
-
-Use the Python 3.12 environment because its ABI matches the bundled TB6-R5
-RPC/Topic extensions. The old `/home/ai/condaenv/openpi` environment is Python
-3.11 and must not be used for real hardware.
-
-Local dependencies and SDK only:
+停止 Docker 服务：
 
 ```bash
-/home/ai/condaenv/openpi_orin/bin/python3 run_pi05_tb6r5.py \
-  --local-check --no-camera
+docker compose -f compose.jax.yml down
 ```
 
-Connect to the model and validate one response without opening a robot RPC
-connection:
+使用其他 GPU 镜像或 checkpoint 时，设置 `JAX_IMAGE`、`JAX_CHECKPOINT_DIR`。`POLICY_CONFIG` 默认 `pi05_pp_white_red_h50`，`JAX_NUM_STEPS` 默认 10，`JAX_POLICY_PORT` 默认 8003。修改端口时，客户端也要用相同的 `POLICY_PORT`。`--allow-hardware` 只表示服务允许已确认的真机客户端连接；运动仍由客户端的 `REAL=1` 决定。
+
+## PyTorch Docker 服务
+
+当前 PyTorch 服务使用 `runtime/openpi/scripts/docker/compose.orin.tb6r5.yml`，模型在 `8002`。它与 JAX 服务是独立进程，启动 JAX 客户端不会自动启动 PyTorch 容器。
 
 ```bash
-/home/ai/condaenv/openpi_orin/bin/python3 run_pi05_tb6r5.py \
-  --dry-run \
-  --smoke-test \
-  --no-camera \
-  --no-show-camera \
-  --first-action-timeout-s 120
+cd /home/ai/pi0.5/pi05_infer/runtime/openpi/scripts/docker
+docker compose --env-file .env.orin.tb6r5 -f compose.orin.tb6r5.yml up -d --wait
+curl --noproxy '*' --fail http://127.0.0.1:8002/healthz
 ```
 
-Black-frame output is meaningless; this command only verifies the complete
-Docker/GPU/websocket response path. It accepts only a finite, non-empty action
-array and does not apply TB6-R5 action limits or process any returned action.
-`--smoke-test` automatically enables `--dry-run` and requires `--no-camera`
-without `--print-rpc`. Omitting `--dry-run` does not enable robot control.
-It runs once by default; set `--max-inference-calls` to validate more responses.
+PyTorch 普通推理入口是 `./run_pytorch.sh`；PyTorch RTC 使用 `rtc_stage/compose.rtc.yml` 的 `8012` 服务和 `./run_pytorch_rtc.sh`。这些入口默认是 dry-run；设置 `REAL=1` 才会进入真机控制。
 
-To diagnose the action-dimension contract, run the dedicated live test after
-starting the policy service. It sends black frames only and never opens a robot
-RPC connection:
+## 录制与排查
+
+独立录制一个 LeRobot episode：在一个终端运行 `./record_one_episode.sh`，另一终端运行推理；结束时在录制终端按一次 `Ctrl+C`，等待打印 `SAVED`。录制与推理的帧率设置、三段任务完成条件、参数含义和故障排查见 [PI05_RTC_LEROBOT_使用说明.md](PI05_RTC_LEROBOT_使用说明.md)。
+
+查看 JAX 日志或进程：
 
 ```bash
-cd /home/ai/pi0.5/pi05_infer
-PI05_RUN_LIVE_POLICY_DIMENSION_TEST=1 \
-  /home/ai/condaenv/openpi_orin/bin/python3 -m unittest \
-  discover -s tests -p 'test_runner.py' -v
+ss -ltnp | grep ':8003'
+docker ps --filter name=pi05-jax
 ```
 
-The test prints the raw action dimension returned by the service alongside the
-dimension declared in the mounted checkpoint's `assets/norm_stats.json`.
-
-Then validate the two default HTTP cameras, still without robot control:
-
-```bash
-/home/ai/condaenv/openpi_orin/bin/python3 run_pi05_tb6r5.py \
-  --dry-run \
-  --print-rpc \
-  --no-show-camera \
-  --max-inference-calls 2 \
-  --task "Pick up the yellow ring and place it on the white plate."
-```
-
-By default the cameras are read from the robot at:
-
-```text
-realsense_0=http://ROBOT_IP:8888/RsCameraSensor/1/0/color
-realsense_1=http://ROBOT_IP:8888/RsCameraSensor/0/0/color
-```
-
-Use `--camera-devices` for V4L2 or `--camera-serials` for local RealSense.
-Local RealSense serial mode additionally needs a Jetson-compatible
-`pyrealsense2`; HTTP and V4L2 modes do not.
-
-During every OpenPI inference, the runner prints the Topic `robottarget` TCP
-pose, `gripper_mm`, and `gripper_joint_m` used by the policy, followed by the
-complete raw policy action chunk before safety validation. Add `--print-rpc`
-to additionally print the exact outgoing controller payload.
-
-## 3. Real hardware gate
-
-Real hardware is disabled unless the explicit confirmation is present. Only
-remove `--dry-run` after checking the model outputs, camera mapping, task text,
-home pose, controller dialect, and gripper model:
-
-```bash
-/home/ai/condaenv/openpi_orin/bin/python3 run_pi05_tb6r5.py \
-  --confirm-hardware TB6R5_REAL_INFERENCE \
-  --robot-ip 192.168.2.174 \
-  --task "Pick up the yellow ring and place it on the white plate." \
-  --no-show-camera
-```
-
-Current host bridge defaults:
-
-- `g_model=3`
-- `cd_version=45`
-- `subloop=0`
-- 30 Hz control, four actions executed from each returned chunk
-- 0.03 rad maximum commanded joint change per step
-- 0.03 m maximum TCP position change and 0.15 rad maximum rotation per step
-- 30–70 mm gripper range
-
-Every observation and action chunk is checked for shape, finite values,
-training-envelope limits, and unsafe jumps. Runtime failures trigger SubLoop
-exit and robot Disable before the process exits.
+如果 `8003` 无监听，先启动上述宿主机或 Docker GPU 服务；如果两种方式同时启动，后启动的一方会因端口冲突失败。

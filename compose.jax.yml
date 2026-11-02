@@ -2,23 +2,24 @@ name: pi05-jax
 
 services:
   tb6r5_jax_policy_server:
-    # The existing Orin image supports CPU checks. GPU use requires a compatible JAX CUDA image.
-    image: ${JAX_IMAGE:-openpi_tb6r5_policy_server:orin-jp62}
+    # Jetson JAX CUDA image, built from jax_gpu_build/Dockerfile.runtime.
+    image: ${JAX_IMAGE:-jax-orin:0.5.3-cuda}
     pull_policy: never
     init: true
     network_mode: host
     runtime: nvidia
     shm_size: 8gb
     volumes:
-      - ${JAX_CHECKPOINT_DIR:?Set JAX_CHECKPOINT_DIR to an OpenPI JAX checkpoint}:/models/pi05_tb6r5:ro
+      - ${JAX_CHECKPOINT_DIR:-/home/ai/pi0.5/model/jax/pi05_pp_white_red_h50/19999}:/models/pi05_tb6r5:ro
       - ./jax_infer.py:/opt/tb6r5/jax_infer.py:ro
-      - ./app/src:/app/src:ro
-      - ./app/packages/openpi-client/src:/app/packages/openpi-client/src:ro
+      # The RTC OpenPI source and websocket client are committed in this repo.
+      - ./rtc_stage/openpi:/app/src/openpi:ro
+      - ./docker_source/packages/openpi-client/src/openpi_client:/app/packages/openpi-client/src/openpi_client:ro
       - ${OPENPI_DATA_HOME:-/home/ai/pi0.5/pi05_infer/cache/openpi}:/openpi_assets
     environment:
       OPENPI_ROOT: /app
       OPENPI_DATA_HOME: /openpi_assets
-      JAX_PLATFORMS: ${JAX_DEVICE:-gpu}
+      JAX_PLATFORMS: cuda
       XLA_PYTHON_CLIENT_PREALLOCATE: "false"
       NVIDIA_VISIBLE_DEVICES: all
       NVIDIA_DRIVER_CAPABILITIES: compute,utility
@@ -27,11 +28,13 @@ services:
     command:
       - serve
       - --checkpoint=/models/pi05_tb6r5
-      - --config=${POLICY_CONFIG:?Set POLICY_CONFIG to the checkpoint training config}
-      - --device=${JAX_DEVICE:-gpu}
+      - --config=${POLICY_CONFIG:-pi05_pp_white_red_h50}
+      - --asset-id=.
+      - --device=gpu
       - --host=0.0.0.0
       - --port=${JAX_POLICY_PORT:-8003}
       - --num-steps=${JAX_NUM_STEPS:-10}
+      - --allow-hardware
     healthcheck:
       test:
         - CMD
