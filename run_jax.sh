@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY="${PYTHON:-/home/ai/condaenv/tb6r5/bin/python}"
 MODEL_CONFIG="${MODEL_CONFIG:-auto}"
 JAX_CHECKPOINT="${JAX_CHECKPOINT:-/home/ai/pi0.5/model/jax/pi05_pp_white_red_h50/19999}"
+CHECKPOINT_HOST_DIR="${CHECKPOINT_HOST_DIR:-$JAX_CHECKPOINT}"
 ROBOT_IP="${ROBOT_IP:-192.168.2.151}"
 POLICY_PORT="${POLICY_PORT:-8003}"
 CAMERA_IP="${CAMERA_IP:-$ROBOT_IP}"
@@ -15,7 +16,7 @@ CAMERA_TOPIC_PORT="${CAMERA_TOPIC_PORT:-19091}"
 CAMERA_TOPIC_SENSORS="${CAMERA_TOPIC_SENSORS:-realsense_0=RsCameraSensor#0#0,realsense_1=RsCameraSensor#1#0}"
 TASK="${TASK:-Pick up the red block and place it in the box on the left}"
 
-export MODEL_CONFIG JAX_CHECKPOINT
+export MODEL_CONFIG JAX_CHECKPOINT CHECKPOINT_HOST_DIR
 
 if [[ "${REAL:-0}" == 1 ]]; then
   MAX_CALLS="${MAX_INFERENCE_CALLS:-0}"
