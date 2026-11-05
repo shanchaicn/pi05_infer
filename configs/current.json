@@ -1,0 +1,15 @@
+{
+  "jax_config": "pi05_pp_white_red_h50_lora",
+  "model": {
+    "action_dim": 32,
+    "action_expert_variant": "gemma_300m_lora",
+    "action_horizon": 50,
+    "discrete_state_input": true,
+    "max_token_len": 200,
+    "paligemma_variant": "gemma_2b_lora",
+    "pi05": true
+  },
+  "pytorch_config": "pi05_pp_white_red_h50_lora_fused",
+  "schema_version": 1,
+  "source_config": "pi05_pp_white_red_h50_lora"
+}

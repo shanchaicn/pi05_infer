@@ -12,6 +12,7 @@ services:
     volumes:
       - ${JAX_CHECKPOINT_DIR:-/home/ai/pi0.5/model/jax/pi05_pp_white_red_h50/19999}:/models/pi05_tb6r5:ro
       - ./jax_infer.py:/opt/tb6r5/jax_infer.py:ro
+      - ./checkpoint_config.py:/opt/tb6r5/checkpoint_config.py:ro
       # The RTC OpenPI source and websocket client are committed in this repo.
       - ./rtc_stage/openpi:/app/src/openpi:ro
       - ./docker_source/packages/openpi-client/src/openpi_client:/app/packages/openpi-client/src/openpi_client:ro
@@ -28,7 +29,7 @@ services:
     command:
       - serve
       - --checkpoint=/models/pi05_tb6r5
-      - --config=${POLICY_CONFIG:-pi05_pp_white_red_h50}
+      - --config=${POLICY_CONFIG:-auto}
       - --asset-id=.
       - --device=gpu
       - --host=0.0.0.0

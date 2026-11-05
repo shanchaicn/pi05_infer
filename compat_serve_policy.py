@@ -13,8 +13,11 @@ import logging
 from pathlib import Path
 import runpy
 import struct
+import sys
 
 import safetensors.torch
+
+from checkpoint_config import replace_auto_config_argv
 
 
 _TIED_EMBEDDING = (
@@ -83,5 +86,6 @@ def _load_model_compat(model, filename, strict=True, device="cpu", *, backend="m
     return missing, remaining_unexpected
 
 
+sys.argv = replace_auto_config_argv(sys.argv, "pytorch")
 safetensors.torch.load_model = _load_model_compat
 runpy.run_path("/app/scripts/serve_policy.py", run_name="__main__")

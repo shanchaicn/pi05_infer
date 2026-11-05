@@ -2,6 +2,39 @@
 
 本仓库提供 `pi05_pp_white_red_h50` 的 JAX / PyTorch 推理服务、真机客户端、RTC 三段任务脚本和 LeRobot 录制入口。当前模型预测 50 步，训练数据的动作表示为 8 维 TCP 位姿及夹爪距离。真机运行前先检查相机、机器人状态和动作方向。
 
+## 训练配置自动同步
+
+推理端不再需要手工复制或改写 `config.py`。训练完成并转换权重后，在训练服务器的本仓库中运行：
+
+```bash
+cd /data/pi05/projects/pi05_infer_github
+python3 tools/sync_training_config.py \
+  --training-root /data/pi05/openpi \
+  --config pi05_pp_white_red_h50_lora \
+  --jax-checkpoint /data/pi05/jax/checkpoints/pi05_pp_white_red_h50_lora/jax_lora/h50_lora_1gpu_b1_20261105_115844/19999 \
+  --pytorch-checkpoint /data/pi05/pytorch/checkpoints/pi05_pp_white_red_h50_lora_h50_19999_fused
+```
+
+该命令会一次完成以下操作：
+
+- 从训练仓库提取指定的完整 `TrainConfig`，同步到两份推理 OpenPI 源码；
+- 为融合 LoRA 的 PyTorch 权重生成对应的 `*_fused` 配置（去掉模型结构中的 `_lora` adapter）；
+- 更新 `configs/current.json`，并在指定 checkpoint 中写入 `inference_config.json`；
+- 重复运行结果相同，可以作为每次训练/转换后的固定步骤。
+
+启动参数默认使用 `auto`。JAX 从 checkpoint 的 `inference_config.json` 选择训练配置；PyTorch 优先读取同一清单，也能根据 `conversion_metadata.json` 自动识别 fused LoRA。传输模型时要把 checkpoint 整个目录一起复制，不要漏掉 JSON 元数据。需要临时指定旧模型时，仍可显式设置 `POLICY_CONFIG` 或传 `--config`，其优先级高于自动识别。
+
+同步后检查并发布配置变更：
+
+```bash
+git diff --check
+git status --short
+git add configs/current.json checkpoint_config.py tools/sync_training_config.py \
+  rtc_stage/openpi/training/config.py docker_source/src/openpi/training/config.py
+git commit -m "sync OpenPI training config for inference"
+git push origin main
+```
+
 ## 代码与第三方依赖
 
 | 组件 | 本仓库位置或外部位置 | 用途 |

@@ -15,8 +15,9 @@ services:
       - ${CHECKPOINT_HOST_DIR:-/home/ai/pi0.5/model/pytorch/pp_white_red/19999}:${CHECKPOINT_CONTAINER_DIR:-/models/pi05_tb6r5}:ro
       - ${OPENPI_DATA_HOME:-/home/ai/pi0.5/pi05_infer/cache/openpi}:/openpi_assets
       - /home/ai/pi0.5/pi05_infer/compat_serve_policy.py:/opt/tb6r5/compat_serve_policy.py:ro
+      - /home/ai/pi0.5/pi05_infer/checkpoint_config.py:/opt/tb6r5/checkpoint_config.py:ro
       # Use the registered pi05_pp_white_red_h50 config and matching model code.
-      - /home/ai/pi0.5/pi05_infer/app/src/openpi:/app/src/openpi:ro
+      - /home/ai/pi0.5/pi05_infer/rtc_stage/openpi:/app/src/openpi:ro
       - /home/ai/pi0.5/pi05_infer/docker_source/scripts:/app/scripts:ro
       - /home/ai/pi0.5/pi05_infer/docker_source/packages/openpi-client/src/openpi_client:/app/packages/openpi-client/src/openpi_client:ro
     environment:
@@ -34,7 +35,7 @@ services:
       - --port
       - ${POLICY_PORT:-8002}
       - policy:checkpoint
-      - --policy.config=${POLICY_CONFIG:-pi05_tb6r5}
+      - --policy.config=${POLICY_CONFIG:-auto}
       - --policy.dir=${CHECKPOINT_CONTAINER_DIR:-/models/pi05_tb6r5}
     healthcheck:
       test:

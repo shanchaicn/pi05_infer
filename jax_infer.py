@@ -13,6 +13,8 @@ import time
 
 import numpy as np
 
+from checkpoint_config import resolve_checkpoint_config
+
 
 def _install_import_paths() -> None:
     """Put the in-repo OpenPI tree and the websocket client on ``sys.path``.
@@ -203,6 +205,7 @@ def load_policy(args):
     jax = initialize_jax(args.device)
     from openpi.training import config
 
+    args.config = resolve_checkpoint_config(args.checkpoint, "jax", args.config)
     train_config = config.get_config(args.config)
     start = time.monotonic()
     with jax.default_device(jax.devices("cuda" if args.device == "gpu" else args.device)[0]):
@@ -301,7 +304,7 @@ def build_parser() -> argparse.ArgumentParser:
             command.add_argument("--device", choices=("gpu", "cpu"), default="gpu")
             command.add_argument("--asset-id", help="Normalization asset under checkpoint/assets; defaults to training config")
             if name != "check":
-                command.add_argument("--config", required=True, help="Exact training config for the JAX checkpoint")
+                command.add_argument("--config", default="auto", help="Training config name, or auto (default) to read checkpoint metadata")
                 command.add_argument("--num-steps", type=positive_int, default=10)
         if name in {"infer", "client"}:
             command.add_argument("--task", help="Language prompt; overrides prompt from --observation")

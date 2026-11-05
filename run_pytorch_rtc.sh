@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY="${PYTHON:-/home/ai/condaenv/tb6r5/bin/python}"
-MODEL_CONFIG="${MODEL_CONFIG:-pi05_pp_white_red_h50}"
+MODEL_CONFIG="${MODEL_CONFIG:-auto}"
 CHECKPOINT_HOST_DIR="${CHECKPOINT_HOST_DIR:-/home/ai/pi0.5/model/pytorch/pp_white_red/19999}"
 ROBOT_IP="${ROBOT_IP:-192.168.2.151}"
 POLICY_PORT="${POLICY_PORT:-8012}"
