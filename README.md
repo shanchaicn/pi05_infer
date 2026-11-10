@@ -47,6 +47,8 @@ git push origin main
 
 OpenPI 上游项目：[Physical-Intelligence/openpi](https://github.com/Physical-Intelligence/openpi)。机器人 SDK 接口示例：[臻识控制器 Python SDK](https://gitee.com/zhenshi-controller-api-data/sdk_send_recevice_demo_py)。本仓库的 RTC 实现与配置经过本地改动，不能直接用上游最新版替换。`app/` 是本机另外一份 OpenPI 工作树，已被 Git 忽略；JAX Docker Compose 使用仓库内已跟踪的 `rtc_stage/openpi/`。机器人 SDK 的二进制扩展不在仓库中，部署新机器时需准备与宿主机 Python、架构匹配的版本。
 
+真机客户端需要的 RPC/Topic SDK、下载地址、平台范围和无机器人导入检查见 [机器人 SDK 安装说明](docs/robot_sdk.md)。
+
 ## 当前模型和端口
 
 | 后端 | 服务端口 | checkpoint | 客户端入口 |
